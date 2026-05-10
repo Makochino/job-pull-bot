@@ -50,7 +50,7 @@ SETTINGS_BUTTON = "⚙️ Settings"
 HELP_BUTTON = "❓ Help"
 
 
-@dataclass(slots=True)
+@dataclass
 class PaginationSession:
     source_type: str
     vacancies: list[Vacancy]
@@ -59,7 +59,7 @@ class PaginationSession:
     message_delay: float = 0.35
 
 
-@dataclass(slots=True)
+@dataclass
 class AppContext:
     owner_id: int
     config: dict[str, Any]
@@ -70,13 +70,13 @@ class AppContext:
     pagination_sessions: dict[int, PaginationSession] = field(default_factory=dict)
 
 
-@dataclass(slots=True)
+@dataclass
 class FilteredBatch:
     matched: list[Vacancy]
     hard_rejected: int = 0
 
 
-@dataclass(slots=True)
+@dataclass
 class FreshBatch:
     vacancies: list[Vacancy]
     duplicates: int = 0
@@ -468,7 +468,9 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
         detail_pages_limit = _config_int(context.config, "website_detail_pages_limit", max_results)
         detail_delay_seconds = float(context.config.get("website_detail_delay_seconds", 0.7))
 
-        website_result = await asyncio.to_thread(
+        loop = asyncio.get_running_loop()
+        website_result = await loop.run_in_executor(
+            None,
             fetch_website_vacancies,
             sites,
             request_timeout,

@@ -22,7 +22,7 @@ class ConfigError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
 
 
-@dataclass(slots=True)
+@dataclass
 class EnvSettings:
     telegram_api_id: int
     telegram_api_hash: str
@@ -30,7 +30,7 @@ class EnvSettings:
     my_telegram_user_id: int
 
 
-@dataclass(slots=True)
+@dataclass
 class Vacancy:
     source: str
     source_type: str
@@ -48,7 +48,7 @@ class Vacancy:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(slots=True)
+@dataclass
 class SourceResult:
     vacancies: list[Vacancy] = field(default_factory=list)
     checked: int = 0

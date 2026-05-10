@@ -90,7 +90,7 @@ SUSPICIOUS_INCOME_TERMS = (
 )
 
 
-@dataclass(slots=True)
+@dataclass
 class FilterResult:
     accepted: bool
     score: int = 0

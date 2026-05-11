@@ -15,6 +15,8 @@ DEFAULT_FEMALE_TERMS = (
     "дівчат",
     "женщина",
     "жінка",
+    "заготовщица",
+    "кухарка",
 )
 
 DEFAULT_FEMALE_JOB_TERMS = (

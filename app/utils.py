@@ -43,8 +43,18 @@ class Vacancy:
     content_hash_exact: str = ""
     content_hash_normalized: str = ""
     content_normalized: str = ""
+    parent_content_hash: str = ""
     location: str = "not specified"
     vacancy_type: str = "other"
+    role: str = ""
+    salary: str = ""
+    schedule: str = ""
+    contact: str = ""
+    age_requirement: str = ""
+    experience_requirement: str = ""
+    gender_requirement: str = ""
+    matched_role_keywords: list[str] = field(default_factory=list)
+    filter_debug: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

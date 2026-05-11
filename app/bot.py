@@ -12,6 +12,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -23,12 +26,18 @@ from aiogram.types import (
 )
 
 from .database import Database
+from .extraction import annotate_vacancy_fields, split_vacancy_candidates
 from .filters import score_vacancy
 from .formatter import (
+    format_deleted_saved_vacancy,
     format_latest,
+    format_no_pending_review,
     format_no_more_vacancies,
     format_pagination_prompt,
     format_pagination_stopped,
+    format_rejected_vacancies,
+    format_review_vacancy,
+    format_saved_vacancies,
     format_settings,
     format_sites_pull_report,
     format_stats,
@@ -44,10 +53,12 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BUTTON = "🔎 Telegram jobs"
 WEBSITE_BUTTON = "🌐 Website jobs"
-LATEST_BUTTON = "📌 Latest"
+SAVED_BUTTON = "❤️ Saved vacancies"
 STATS_BUTTON = "📊 Stats"
 SETTINGS_BUTTON = "⚙️ Settings"
 HELP_BUTTON = "❓ Help"
+SAVED_DELETE_BUTTON = "🗑 Delete"
+SAVED_EXIT_BUTTON = "🚪 Exit"
 
 
 @dataclass
@@ -73,6 +84,7 @@ class AppContext:
 @dataclass
 class FilteredBatch:
     matched: list[Vacancy]
+    rejected: int = 0
     hard_rejected: int = 0
 
 
@@ -82,6 +94,11 @@ class FreshBatch:
     duplicates: int = 0
     cross_channel_duplicates: int = 0
     already_sent: int = 0
+
+
+class SavedVacancyStates(StatesGroup):
+    browsing = State()
+    waiting_delete_number = State()
 
 
 def _config_int(config: dict[str, Any], key: str, default: int) -> int:
@@ -168,13 +185,36 @@ def _reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=TELEGRAM_BUTTON), KeyboardButton(text=WEBSITE_BUTTON)],
-            [KeyboardButton(text=LATEST_BUTTON), KeyboardButton(text=STATS_BUTTON)],
+            [KeyboardButton(text=SAVED_BUTTON), KeyboardButton(text=STATS_BUTTON)],
             [KeyboardButton(text=SETTINGS_BUTTON), KeyboardButton(text=HELP_BUTTON)],
         ],
         resize_keyboard=True,
         is_persistent=True,
         one_time_keyboard=False,
         input_field_placeholder="Choose an action",
+    )
+
+
+def _saved_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=SAVED_DELETE_BUTTON), KeyboardButton(text=SAVED_EXIT_BUTTON)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Manage saved vacancies",
+    )
+
+
+def _review_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Like", callback_data=f"review:like:{vacancy_id}"),
+                InlineKeyboardButton(text="❌ Dislike", callback_data=f"review:dislike:{vacancy_id}"),
+            ]
+        ]
     )
 
 
@@ -198,7 +238,8 @@ def _start_text() -> str:
         "<b>Commands:</b>\n"
         "• /pull_tg — search Telegram channels\n"
         "• /pull_sites — search websites\n"
-        "• /latest — latest saved vacancies\n"
+        "• /review — continue vacancy review\n"
+        "• /saved — manage liked vacancies\n"
         "• /stats — statistics\n"
         "• /settings — current filters\n"
         "• /help — help"
@@ -210,7 +251,8 @@ def _help_text() -> str:
         "❓ <b>Help</b>\n\n"
         f"• <b>{TELEGRAM_BUTTON}</b> or /pull_tg — search Telegram channels.\n"
         f"• <b>{WEBSITE_BUTTON}</b> or /pull_sites — search websites.\n"
-        f"• <b>{LATEST_BUTTON}</b> or /latest — show latest saved vacancies.\n"
+        "• <b>/review</b> — continue reviewing pending vacancies one by one.\n"
+        f"• <b>{SAVED_BUTTON}</b>, /saved, /liked or /latest — manage liked vacancies.\n"
         f"• <b>{STATS_BUTTON}</b> or /stats — show counters.\n"
         f"• <b>{SETTINGS_BUTTON}</b> or /settings — show active filters.\n\n"
         "Telegram cannot remove the text input field completely, but the persistent buttons below stay available for quick control.\n\n"
@@ -251,17 +293,29 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
             return
         await _send_settings(message, context)
 
-    @router.message(Command("latest"))
-    async def latest_handler(message: Message) -> None:
+    @router.message(Command("review"))
+    async def review_handler(message: Message) -> None:
         if not await _prepare_command(message, context):
             return
-        await _send_latest(message, context)
+        await _send_next_review_vacancy(message, context)
 
-    @router.message(F.text == LATEST_BUTTON)
-    async def latest_button_handler(message: Message) -> None:
+    @router.message(Command("latest", "liked", "saved"))
+    async def saved_command_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
-        await _send_latest(message, context)
+        await _open_saved_vacancies(message, context, state)
+
+    @router.message(F.text == SAVED_BUTTON)
+    async def saved_button_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _open_saved_vacancies(message, context, state)
+
+    @router.message(Command("rejected", "rejected_last"))
+    async def rejected_handler(message: Message) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _send_rejected(message, context)
 
     @router.message(Command("stats"))
     async def stats_handler(message: Message) -> None:
@@ -309,6 +363,54 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
             return
         await _start_sites_pull(message, context)
 
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_DELETE_BUTTON)
+    async def saved_delete_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        rows = context.database.liked_vacancies()
+        if not rows:
+            await _answer(message, context, "❤️ <b>No saved vacancies to delete.</b>", reply_markup=_saved_keyboard())
+            return
+        await state.set_state(SavedVacancyStates.waiting_delete_number)
+        await _answer(
+            message,
+            context,
+            "🗑 Send the number of the saved vacancy you want to delete.",
+            reply_markup=_saved_keyboard(),
+        )
+
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_EXIT_BUTTON)
+    async def saved_exit_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.clear()
+        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
+
+    @router.message(SavedVacancyStates.waiting_delete_number, F.text == SAVED_EXIT_BUTTON)
+    async def saved_delete_exit_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.clear()
+        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
+
+    @router.message(SavedVacancyStates.waiting_delete_number)
+    async def saved_delete_number_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _handle_saved_delete_number(message, context, state)
+
+    @router.message(SavedVacancyStates.browsing)
+    async def saved_browsing_fallback(message: Message) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _answer(message, context, "Use Delete or Exit in saved-vacancies mode.", reply_markup=_saved_keyboard())
+
+    @router.callback_query(F.data.startswith("review:"))
+    async def review_callback(callback: CallbackQuery) -> None:
+        if not await _is_authorized_callback(callback, context):
+            return
+        await _handle_review_callback(callback, context)
+
     @router.callback_query(F.data.startswith("page:"))
     async def pagination_callback(callback: CallbackQuery) -> None:
         if not await _is_authorized_callback(callback, context):
@@ -327,6 +429,130 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
 async def _send_latest(message: Message, context: AppContext) -> None:
     rows = context.database.latest(limit=10)
     await _answer(message, context, format_latest(rows), disable_web_page_preview=True)
+
+
+async def _send_next_review_vacancy(message: Message, context: AppContext) -> None:
+    row = context.database.next_pending_vacancy()
+    if row is None:
+        await _answer(message, context, format_no_pending_review())
+        return
+
+    left_count = context.database.pending_review_count()
+    await _answer(
+        message,
+        context,
+        format_review_vacancy(row, left_count),
+        reply_markup=_review_keyboard(int(row["id"])),
+        disable_web_page_preview=True,
+    )
+
+
+async def _handle_review_callback(callback: CallbackQuery, context: AppContext) -> None:
+    data = callback.data or ""
+    parts = data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+
+    _, action, raw_id = parts
+    try:
+        vacancy_id = int(raw_id)
+    except ValueError:
+        await callback.answer()
+        return
+
+    if action == "like":
+        changed = context.database.like_vacancy(vacancy_id)
+        await callback.answer("Saved" if changed else "Already reviewed")
+    elif action == "dislike":
+        changed = context.database.dislike_vacancy(vacancy_id)
+        await callback.answer("Disliked" if changed else "Already reviewed")
+    else:
+        await callback.answer()
+        return
+
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            logger.debug("Could not remove review buttons from message %s", callback.message.message_id)
+        if not changed:
+            return
+        await _send_next_review_vacancy(callback.message, context)
+
+
+async def _open_saved_vacancies(message: Message, context: AppContext, state: FSMContext) -> None:
+    await state.set_state(SavedVacancyStates.browsing)
+    await _send_saved_vacancies(message, context)
+
+
+async def _send_saved_vacancies(message: Message, context: AppContext) -> None:
+    chunks = format_saved_vacancies(context.database.liked_vacancies())
+    for chunk in chunks:
+        await _answer(
+            message,
+            context,
+            chunk,
+            reply_markup=_saved_keyboard(),
+            disable_web_page_preview=True,
+        )
+
+
+async def _handle_saved_delete_number(message: Message, context: AppContext, state: FSMContext) -> None:
+    raw_value = (message.text or "").strip()
+    if not raw_value.isdigit():
+        await _answer(
+            message,
+            context,
+            "Send a plain number, for example <b>3</b>, or press Exit.",
+            reply_markup=_saved_keyboard(),
+        )
+        return
+
+    rows = context.database.liked_vacancies()
+    if not rows:
+        await state.set_state(SavedVacancyStates.browsing)
+        await _answer(message, context, "❤️ <b>No saved vacancies to delete.</b>", reply_markup=_saved_keyboard())
+        return
+
+    number = int(raw_value)
+    if number < 1 or number > len(rows):
+        await _answer(
+            message,
+            context,
+            f"Number out of range. Send a number from <b>1</b> to <b>{len(rows)}</b>, or press Exit.",
+            reply_markup=_saved_keyboard(),
+        )
+        return
+
+    row = rows[number - 1]
+    deleted = context.database.delete_liked_vacancy(int(row["id"]))
+    await state.set_state(SavedVacancyStates.browsing)
+    if not deleted:
+        await _answer(
+            message,
+            context,
+            "That saved vacancy was already changed. Here is the updated saved list.",
+            reply_markup=_saved_keyboard(),
+        )
+    else:
+        await _answer(
+            message,
+            context,
+            format_deleted_saved_vacancy(row, number),
+            reply_markup=_saved_keyboard(),
+            disable_web_page_preview=True,
+        )
+    await _send_saved_vacancies(message, context)
+
+
+async def _send_rejected(message: Message, context: AppContext) -> None:
+    await _answer(
+        message,
+        context,
+        format_rejected_vacancies(context.database.latest_rejected(limit=10)),
+        disable_web_page_preview=True,
+    )
 
 
 async def _send_stats(message: Message, context: AppContext) -> None:
@@ -367,7 +593,6 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
         max_results = _config_int(context.config, "max_results_per_pull", 20)
         latest_limit = _config_int(context.config, "telegram_latest_limit", 10)
         resend_latest = _config_bool(context.config, "telegram_resend_latest_on_pull", False)
-        message_delay = float(context.config.get("message_delay_seconds", 0.35))
 
         telegram_result = (
             await fetch_telegram_vacancies(
@@ -379,7 +604,7 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
             else SourceResult()
         )
 
-        filtered = _filter_candidates(telegram_result.vacancies, context.config)
+        filtered = _filter_candidates(telegram_result.vacancies, context.config, context.database)
         if resend_latest:
             mode = f"latest {latest_limit} matching posts"
             unique = _prepare_current_pull_vacancies(_sort_latest(filtered.matched))
@@ -395,15 +620,18 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
             cross_channel_duplicates = fresh.cross_channel_duplicates
             already_sent = fresh.already_sent
 
-        _save_pending_vacancies(context.database, queued)
-        sent_now = await _start_paginated_delivery(message, context, "telegram", queued, message_delay)
-        pending = max(0, len(queued) - sent_now)
+        queued_now = _save_pending_vacancies(context.database, queued)
+        insert_duplicates = max(0, len(queued) - queued_now)
+        duplicates += insert_duplicates
+        pending = context.database.pending_review_count()
 
         context.database.increment_stats(
             {
                 "pull_tg_total": 1,
                 "tg_checked_total": telegram_result.checked,
                 "matched_tg_total": len(filtered.matched),
+                "rejected_total": filtered.rejected,
+                "rejected_tg_total": filtered.rejected,
                 "hard_rejected_total": filtered.hard_rejected,
                 "hard_rejected_tg_total": filtered.hard_rejected,
                 "duplicates_total": duplicates,
@@ -412,22 +640,23 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
                 "cross_channel_duplicates_tg_total": cross_channel_duplicates,
                 "already_sent_total": already_sent,
                 "already_sent_tg_total": already_sent,
-                "sent_total": sent_now,
-                "sent_tg_total": sent_now,
+                "queued_total": queued_now,
+                "queued_tg_total": queued_now,
                 "source_errors_tg_total": telegram_result.errors,
             }
         )
 
         logger.info(
-            "/pull_tg finished: mode=%s checked=%s matched=%s hard_rejected=%s duplicates=%s cross_channel=%s already_sent=%s sent_now=%s pending=%s errors=%s",
+            "/pull_tg finished: mode=%s checked=%s matched=%s rejected=%s hard_rejected=%s duplicates=%s cross_channel=%s already_sent=%s queued_now=%s pending=%s errors=%s",
             mode,
             telegram_result.checked,
             len(filtered.matched),
+            filtered.rejected,
             filtered.hard_rejected,
             duplicates,
             cross_channel_duplicates,
             already_sent,
-            sent_now,
+            queued_now,
             pending,
             telegram_result.errors,
         )
@@ -439,16 +668,18 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
                 mode=mode,
                 posts_checked=telegram_result.checked,
                 matched=len(filtered.matched),
-                hard_rejected=filtered.hard_rejected,
+                hard_rejected=filtered.rejected,
                 duplicates=duplicates,
                 cross_channel_duplicates=cross_channel_duplicates,
                 already_sent=already_sent,
-                sent_now=sent_now,
+                sent_now=queued_now,
                 pending=pending,
                 source_errors=telegram_result.errors,
                 channels_empty=channels_empty,
             ),
         )
+        if queued_now:
+            await _send_next_review_vacancy(message, context)
     except Exception:
         logger.exception("Critical /pull_tg error")
         await _answer(message, context, "⚠️ <b>/pull_tg failed.</b>\nDetails were written to logs/app.log.")
@@ -461,7 +692,6 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
         sites = load_sites(context.base_dir / "sites.yaml")
         request_timeout = _config_int(context.config, "website_request_timeout", 15)
         max_results = _config_int(context.config, "max_results_per_pull", 20)
-        message_delay = float(context.config.get("message_delay_seconds", 0.35))
         user_agent = str(context.config.get("website_user_agent", "Mozilla/5.0 TelegramJobPullBot/1.0"))
         website_headers = dict(context.config.get("website_headers") or {})
         debug_parsing = bool(context.config.get("debug_parsing", True))
@@ -480,15 +710,16 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
             detail_delay_seconds,
         )
 
-        filtered = _filter_candidates(website_result.vacancies, context.config)
+        filtered = _filter_candidates(website_result.vacancies, context.config, context.database)
         _log_website_match_counts(website_result, filtered.matched)
         fresh = _prepare_fresh_vacancies(context.database, filtered.matched)
         queued = fresh.vacancies[:max_results]
         new_sendable = len(fresh.vacancies)
         detail_pages_fetched = _website_detail_pages_fetched(website_result)
-        _save_pending_vacancies(context.database, queued)
-        sent_now = await _start_paginated_delivery(message, context, "website", queued, message_delay)
-        pending = max(0, len(queued) - sent_now)
+        queued_now = _save_pending_vacancies(context.database, queued)
+        insert_duplicates = max(0, len(queued) - queued_now)
+        fresh.duplicates += insert_duplicates
+        pending = context.database.pending_review_count()
 
         context.database.increment_stats(
             {
@@ -497,6 +728,8 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
                 "site_cards_found_total": website_result.cards_found,
                 "site_parsed_total": website_result.parsed,
                 "matched_sites_total": len(filtered.matched),
+                "rejected_total": filtered.rejected,
+                "rejected_sites_total": filtered.rejected,
                 "hard_rejected_total": filtered.hard_rejected,
                 "hard_rejected_sites_total": filtered.hard_rejected,
                 "duplicates_total": fresh.duplicates,
@@ -505,22 +738,23 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
                 "cross_channel_duplicates_sites_total": fresh.cross_channel_duplicates,
                 "already_sent_total": fresh.already_sent,
                 "already_sent_sites_total": fresh.already_sent,
-                "sent_total": sent_now,
-                "sent_sites_total": sent_now,
+                "queued_total": queued_now,
+                "queued_sites_total": queued_now,
                 "source_errors_sites_total": website_result.errors,
             }
         )
 
         logger.info(
-            "/pull_sites finished: checked=%s cards=%s parsed=%s matched=%s hard_rejected=%s duplicates=%s already_sent=%s sent_now=%s pending=%s errors=%s",
+            "/pull_sites finished: checked=%s cards=%s parsed=%s matched=%s rejected=%s hard_rejected=%s duplicates=%s already_sent=%s queued_now=%s pending=%s errors=%s",
             website_result.checked,
             website_result.cards_found,
             website_result.parsed,
             len(filtered.matched),
+            filtered.rejected,
             filtered.hard_rejected,
             fresh.duplicates,
             fresh.already_sent,
-            sent_now,
+            queued_now,
             pending,
             website_result.errors,
         )
@@ -534,44 +768,76 @@ async def _run_pull_sites(message: Message, context: AppContext) -> None:
                 vacancy_cards_found=website_result.cards_found,
                 parsed_cards=website_result.parsed,
                 matched=len(filtered.matched),
-                hard_rejected=filtered.hard_rejected,
+                hard_rejected=filtered.rejected,
                 detail_pages_fetched=detail_pages_fetched,
                 duplicates=fresh.duplicates,
                 already_sent=fresh.already_sent,
                 new_sendable=new_sendable,
-                sent_now=sent_now,
+                sent_now=queued_now,
                 pending=pending,
                 source_errors=website_result.errors,
                 debug_summaries=debug_lines,
             ),
         )
+        if queued_now:
+            await _send_next_review_vacancy(message, context)
     except Exception:
         logger.exception("Critical /pull_sites error")
         await _answer(message, context, "⚠️ <b>/pull_sites failed.</b>\nDetails were written to logs/app.log.")
 
 
-def _filter_candidates(candidates: list[Vacancy], config: dict[str, Any]) -> FilteredBatch:
+def _filter_candidates(candidates: list[Vacancy], config: dict[str, Any], database: Database | None = None) -> FilteredBatch:
     matched: list[Vacancy] = []
+    rejected = 0
     hard_rejected = 0
     for vacancy in candidates:
-        result = score_vacancy(vacancy, config)
-        if result.hard_rejected:
-            hard_rejected += 1
-            logger.info(
-                "Hard rejected vacancy: source=%s type=%s reason=%s title=%s",
-                vacancy.source,
-                vacancy.source_type,
-                result.reject_reason,
-                vacancy.title,
+        for candidate in split_vacancy_candidates(vacancy):
+            result = score_vacancy(candidate, config)
+            candidate.filter_debug = (
+                f"accepted={result.accepted}; score={result.score}; "
+                f"core={result.matched_core_keywords}; context={result.matched_context_keywords}; "
+                f"bonus={result.matched_bonus_keywords}; reason={result.reject_reason}"
             )
-            continue
-        if not result.accepted:
-            continue
-        vacancy.score = result.score
-        vacancy.location = result.location
-        vacancy.vacancy_type = result.vacancy_type
-        matched.append(vacancy)
-    return FilteredBatch(matched=matched, hard_rejected=hard_rejected)
+            if result.hard_rejected:
+                rejected += 1
+                hard_rejected += 1
+                annotate_vacancy_fields(candidate)
+                if database:
+                    database.record_rejected_vacancy(
+                        candidate,
+                        result.reject_reason or "hard rejected",
+                        score=result.score,
+                        hard_rejected=True,
+                    )
+                logger.info(
+                    "Hard rejected vacancy: source=%s type=%s reason=%s title=%s",
+                    candidate.source,
+                    candidate.source_type,
+                    result.reject_reason,
+                    candidate.title,
+                )
+                continue
+            if not result.accepted:
+                rejected += 1
+                annotate_vacancy_fields(candidate)
+                if database:
+                    database.record_rejected_vacancy(
+                        candidate,
+                        result.reject_reason or "below relevance threshold",
+                        score=result.score,
+                        hard_rejected=False,
+                    )
+                continue
+            candidate.score = result.score
+            candidate.location = candidate.location if candidate.location != "not specified" else result.location
+            candidate.vacancy_type = candidate.role or result.vacancy_type
+            if not candidate.role or candidate.role == "other":
+                candidate.role = result.vacancy_type
+            if not candidate.matched_role_keywords:
+                candidate.matched_role_keywords = result.matched_core_keywords
+            annotate_vacancy_fields(candidate)
+            matched.append(candidate)
+    return FilteredBatch(matched=matched, rejected=rejected, hard_rejected=hard_rejected)
 
 
 def _prepare_fresh_vacancies(database: Database, vacancies: list[Vacancy]) -> FreshBatch:
@@ -583,16 +849,18 @@ def _prepare_fresh_vacancies(database: Database, vacancies: list[Vacancy]) -> Fr
     for vacancy in vacancies:
         duplicate = database.find_duplicate(vacancy)
         if duplicate:
-            if bool(duplicate.get("sent")):
+            state = str(duplicate.get("review_state") or "")
+            if bool(duplicate.get("sent")) or state in {"liked", "disliked", "deleted"}:
                 already_sent += 1
             else:
                 duplicates += 1
             if bool(duplicate.get("cross_channel")):
                 cross_channel_duplicates += 1
             logger.info(
-                "Duplicate vacancy skipped: kind=%s sent=%s cross_channel=%s source=%s title=%s",
+                "Duplicate vacancy skipped: kind=%s sent=%s state=%s cross_channel=%s source=%s title=%s",
                 duplicate.get("kind"),
                 duplicate.get("sent"),
+                state,
                 duplicate.get("cross_channel"),
                 vacancy.source,
                 vacancy.title,
@@ -667,11 +935,11 @@ def _find_current_batch_duplicate(vacancy: Vacancy, fresh: list[Vacancy]) -> Vac
 
 
 def _save_pending_vacancies(database: Database, vacancies: list[Vacancy]) -> int:
-    duplicates = 0
+    inserted = 0
     for vacancy in vacancies:
-        if not database.insert_vacancy(vacancy, sent=False):
-            duplicates += 1
-    return duplicates
+        if database.insert_vacancy(vacancy, sent=False, review_state="pending"):
+            inserted += 1
+    return inserted
 
 
 async def _start_paginated_delivery(
@@ -838,7 +1106,9 @@ async def _set_command_menu(bot: Bot) -> None:
                 BotCommand(command="start", description="Open bot buttons"),
                 BotCommand(command="pull_tg", description="Search Telegram channels"),
                 BotCommand(command="pull_sites", description="Search job websites"),
-                BotCommand(command="latest", description="Latest saved vacancies"),
+                BotCommand(command="review", description="Review pending vacancies"),
+                BotCommand(command="saved", description="Manage liked vacancies"),
+                BotCommand(command="rejected", description="Recent rejected vacancies"),
                 BotCommand(command="stats", description="Statistics"),
                 BotCommand(command="settings", description="Current filters"),
                 BotCommand(command="help", description="Help"),
@@ -874,7 +1144,7 @@ async def run_bot(
     base_dir: Path,
 ) -> None:
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dispatcher = Dispatcher()
+    dispatcher = Dispatcher(storage=MemoryStorage())
     context = AppContext(
         owner_id=owner_id,
         config=config,

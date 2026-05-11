@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -40,7 +41,53 @@ class Database:
                     content_hash_normalized TEXT,
                     content_normalized TEXT,
                     sent_at TEXT,
-                    sent INTEGER NOT NULL DEFAULT 0
+                    sent INTEGER NOT NULL DEFAULT 0,
+                    review_state TEXT NOT NULL DEFAULT 'pending',
+                    reviewed_at TEXT,
+                    saved_at TEXT,
+                    deleted_at TEXT,
+                    parent_content_hash TEXT,
+                    extracted_role TEXT,
+                    extracted_salary TEXT,
+                    extracted_schedule TEXT,
+                    extracted_location TEXT,
+                    extracted_contact TEXT,
+                    extracted_age_requirement TEXT,
+                    extracted_experience_requirement TEXT,
+                    extracted_gender_requirement TEXT,
+                    matched_role_keywords TEXT,
+                    filter_debug TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS rejected_vacancies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    title TEXT,
+                    text TEXT NOT NULL,
+                    link TEXT,
+                    published_at TEXT,
+                    score INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    seen_count INTEGER NOT NULL DEFAULT 1,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    content_hash_exact TEXT,
+                    content_hash_normalized TEXT,
+                    content_normalized TEXT,
+                    parent_content_hash TEXT,
+                    extracted_role TEXT,
+                    extracted_salary TEXT,
+                    extracted_schedule TEXT,
+                    extracted_location TEXT,
+                    extracted_contact TEXT,
+                    extracted_age_requirement TEXT,
+                    extracted_experience_requirement TEXT,
+                    extracted_gender_requirement TEXT,
+                    matched_role_keywords TEXT,
+                    reject_reason TEXT NOT NULL,
+                    hard_rejected INTEGER NOT NULL DEFAULT 0,
+                    filter_debug TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS stats (
@@ -63,6 +110,18 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_vacancies_normalized_hash
                     ON vacancies(content_hash_normalized);
+
+                CREATE INDEX IF NOT EXISTS idx_vacancies_review_state
+                    ON vacancies(review_state);
+
+                CREATE INDEX IF NOT EXISTS idx_vacancies_saved_at
+                    ON vacancies(saved_at);
+
+                CREATE INDEX IF NOT EXISTS idx_vacancies_parent_hash
+                    ON vacancies(parent_content_hash);
+
+                CREATE INDEX IF NOT EXISTS idx_rejected_last_seen_at
+                    ON rejected_vacancies(last_seen_at);
                 """
             )
         logger.info("SQLite database initialized: %s", self.path)
@@ -72,15 +131,46 @@ class Database:
             row["name"]
             for row in connection.execute("PRAGMA table_info(vacancies)").fetchall()
         }
+        had_review_state = "review_state" in columns
         migrations = {
             "content_hash_exact": "ALTER TABLE vacancies ADD COLUMN content_hash_exact TEXT",
             "content_hash_normalized": "ALTER TABLE vacancies ADD COLUMN content_hash_normalized TEXT",
             "content_normalized": "ALTER TABLE vacancies ADD COLUMN content_normalized TEXT",
             "sent_at": "ALTER TABLE vacancies ADD COLUMN sent_at TEXT",
+            "review_state": "ALTER TABLE vacancies ADD COLUMN review_state TEXT NOT NULL DEFAULT 'pending'",
+            "reviewed_at": "ALTER TABLE vacancies ADD COLUMN reviewed_at TEXT",
+            "saved_at": "ALTER TABLE vacancies ADD COLUMN saved_at TEXT",
+            "deleted_at": "ALTER TABLE vacancies ADD COLUMN deleted_at TEXT",
+            "parent_content_hash": "ALTER TABLE vacancies ADD COLUMN parent_content_hash TEXT",
+            "extracted_role": "ALTER TABLE vacancies ADD COLUMN extracted_role TEXT",
+            "extracted_salary": "ALTER TABLE vacancies ADD COLUMN extracted_salary TEXT",
+            "extracted_schedule": "ALTER TABLE vacancies ADD COLUMN extracted_schedule TEXT",
+            "extracted_location": "ALTER TABLE vacancies ADD COLUMN extracted_location TEXT",
+            "extracted_contact": "ALTER TABLE vacancies ADD COLUMN extracted_contact TEXT",
+            "extracted_age_requirement": "ALTER TABLE vacancies ADD COLUMN extracted_age_requirement TEXT",
+            "extracted_experience_requirement": "ALTER TABLE vacancies ADD COLUMN extracted_experience_requirement TEXT",
+            "extracted_gender_requirement": "ALTER TABLE vacancies ADD COLUMN extracted_gender_requirement TEXT",
+            "matched_role_keywords": "ALTER TABLE vacancies ADD COLUMN matched_role_keywords TEXT",
+            "filter_debug": "ALTER TABLE vacancies ADD COLUMN filter_debug TEXT",
         }
         for column, sql in migrations.items():
             if column not in columns:
                 connection.execute(sql)
+
+        if not had_review_state:
+            connection.execute(
+                """
+                UPDATE vacancies
+                SET review_state = CASE
+                        WHEN sent = 1 THEN 'disliked'
+                        ELSE 'pending'
+                    END,
+                    reviewed_at = CASE
+                        WHEN sent = 1 THEN COALESCE(sent_at, created_at)
+                        ELSE reviewed_at
+                    END
+                """
+            )
 
         rows = connection.execute(
             """
@@ -112,13 +202,20 @@ class Database:
                 (row["content_hash_normalized"] or normalized_content_hash(normalized), normalized, row["id"]),
             )
 
-    def insert_vacancy(self, vacancy: Vacancy, sent: bool = False) -> bool:
+    @staticmethod
+    def _json_list(values: list[Any] | tuple[Any, ...] | None) -> str:
+        return json.dumps(list(values or []), ensure_ascii=False)
+
+    def insert_vacancy(self, vacancy: Vacancy, sent: bool = False, review_state: str = "pending") -> bool:
         exact_hash = vacancy.content_hash_exact or vacancy.content_hash
         normalized_text = vacancy.content_normalized or normalize_vacancy_content(
             "\n".join([vacancy.title or "", vacancy.text or ""])
         )
         normalized_hash = vacancy.content_hash_normalized or normalized_content_hash(normalized_text)
         created_at = now_iso()
+        reviewed_at = created_at if review_state in {"liked", "disliked", "deleted"} else None
+        saved_at = created_at if review_state == "liked" else None
+        deleted_at = created_at if review_state == "deleted" else None
         try:
             with self._connect() as connection:
                 connection.execute(
@@ -126,9 +223,14 @@ class Database:
                     INSERT INTO vacancies (
                         source, source_type, title, text, link, published_at,
                         score, created_at, content_hash, content_hash_exact,
-                        content_hash_normalized, content_normalized, sent, sent_at
+                        content_hash_normalized, content_normalized, sent, sent_at,
+                        review_state, reviewed_at, saved_at, deleted_at,
+                        parent_content_hash, extracted_role, extracted_salary,
+                        extracted_schedule, extracted_location, extracted_contact,
+                        extracted_age_requirement, extracted_experience_requirement,
+                        extracted_gender_requirement, matched_role_keywords, filter_debug
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         vacancy.source,
@@ -145,6 +247,21 @@ class Database:
                         normalized_text,
                         1 if sent else 0,
                         created_at if sent else None,
+                        review_state,
+                        reviewed_at,
+                        saved_at,
+                        deleted_at,
+                        vacancy.parent_content_hash,
+                        vacancy.role or vacancy.vacancy_type,
+                        vacancy.salary,
+                        vacancy.schedule,
+                        vacancy.location,
+                        vacancy.contact,
+                        vacancy.age_requirement,
+                        vacancy.experience_requirement,
+                        vacancy.gender_requirement,
+                        self._json_list(vacancy.matched_role_keywords),
+                        vacancy.filter_debug,
                     ),
                 )
             return True
@@ -152,25 +269,195 @@ class Database:
             return False
 
     def mark_sent(self, content_hash: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE vacancies SET sent = 1, sent_at = COALESCE(sent_at, ?) WHERE content_hash = ? OR content_hash_exact = ?",
-                (now_iso(), content_hash, content_hash),
-            )
-
-    def mark_sent_by_hashes(self, exact_hash: str, normalized_hash: str = "", source_type: str = "") -> None:
+        timestamp = now_iso()
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE vacancies
-                SET sent = 1, sent_at = COALESCE(sent_at, ?)
+                SET sent = 1,
+                    sent_at = COALESCE(sent_at, ?),
+                    review_state = CASE WHEN review_state = 'pending' THEN 'disliked' ELSE review_state END,
+                    reviewed_at = CASE WHEN review_state = 'pending' THEN COALESCE(reviewed_at, ?) ELSE reviewed_at END
+                WHERE content_hash = ? OR content_hash_exact = ?
+                """,
+                (timestamp, timestamp, content_hash, content_hash),
+            )
+
+    def mark_sent_by_hashes(self, exact_hash: str, normalized_hash: str = "", source_type: str = "") -> None:
+        timestamp = now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE vacancies
+                SET sent = 1,
+                    sent_at = COALESCE(sent_at, ?),
+                    review_state = CASE WHEN review_state = 'pending' THEN 'disliked' ELSE review_state END,
+                    reviewed_at = CASE WHEN review_state = 'pending' THEN COALESCE(reviewed_at, ?) ELSE reviewed_at END
                 WHERE (content_hash = ?
                    OR content_hash_exact = ?
                    OR (? != '' AND content_hash_normalized = ?))
                   AND (? = '' OR source_type = ?)
                 """,
-                (now_iso(), exact_hash, exact_hash, normalized_hash, normalized_hash, source_type, source_type),
+                (timestamp, timestamp, exact_hash, exact_hash, normalized_hash, normalized_hash, source_type, source_type),
             )
+
+    def record_rejected_vacancy(
+        self,
+        vacancy: Vacancy,
+        reject_reason: str,
+        score: int = 0,
+        hard_rejected: bool = False,
+    ) -> None:
+        exact_hash = vacancy.content_hash_exact or vacancy.content_hash
+        normalized_text = vacancy.content_normalized or normalize_vacancy_content(
+            "\n".join([vacancy.title or "", vacancy.text or ""])
+        )
+        normalized_hash = vacancy.content_hash_normalized or normalized_content_hash(normalized_text)
+        timestamp = now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rejected_vacancies (
+                    source, source_type, title, text, link, published_at, score,
+                    created_at, last_seen_at, content_hash, content_hash_exact,
+                    content_hash_normalized, content_normalized, parent_content_hash,
+                    extracted_role, extracted_salary, extracted_schedule,
+                    extracted_location, extracted_contact, extracted_age_requirement,
+                    extracted_experience_requirement, extracted_gender_requirement,
+                    matched_role_keywords, reject_reason, hard_rejected, filter_debug
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(content_hash) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at,
+                    seen_count = seen_count + 1,
+                    score = excluded.score,
+                    reject_reason = excluded.reject_reason,
+                    hard_rejected = excluded.hard_rejected,
+                    matched_role_keywords = excluded.matched_role_keywords,
+                    filter_debug = excluded.filter_debug
+                """,
+                (
+                    vacancy.source,
+                    vacancy.source_type,
+                    vacancy.title,
+                    vacancy.text,
+                    vacancy.link,
+                    vacancy.published_at,
+                    score,
+                    timestamp,
+                    timestamp,
+                    exact_hash,
+                    exact_hash,
+                    normalized_hash,
+                    normalized_text,
+                    vacancy.parent_content_hash,
+                    vacancy.role or vacancy.vacancy_type,
+                    vacancy.salary,
+                    vacancy.schedule,
+                    vacancy.location,
+                    vacancy.contact,
+                    vacancy.age_requirement,
+                    vacancy.experience_requirement,
+                    vacancy.gender_requirement,
+                    self._json_list(vacancy.matched_role_keywords),
+                    reject_reason,
+                    1 if hard_rejected else 0,
+                    vacancy.filter_debug,
+                ),
+            )
+
+    def pending_review_count(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM vacancies
+                WHERE review_state = 'pending'
+                """
+            ).fetchone()
+        return int(row["count"])
+
+    def next_pending_vacancy(self) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM vacancies
+                WHERE review_state = 'pending'
+                ORDER BY datetime(created_at) ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    def get_vacancy(self, vacancy_id: int) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM vacancies WHERE id = ?",
+                (vacancy_id,),
+            ).fetchone()
+
+    def _set_review_state(self, vacancy_id: int, state: str) -> bool:
+        timestamp = now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies
+                SET review_state = ?,
+                    reviewed_at = COALESCE(reviewed_at, ?),
+                    saved_at = CASE WHEN ? = 'liked' THEN COALESCE(saved_at, ?) ELSE saved_at END,
+                    deleted_at = CASE WHEN ? = 'deleted' THEN COALESCE(deleted_at, ?) ELSE deleted_at END
+                WHERE id = ?
+                  AND review_state = 'pending'
+                """,
+                (state, timestamp, state, timestamp, state, timestamp, vacancy_id),
+            )
+        return cursor.rowcount > 0
+
+    def like_vacancy(self, vacancy_id: int) -> bool:
+        return self._set_review_state(vacancy_id, "liked")
+
+    def dislike_vacancy(self, vacancy_id: int) -> bool:
+        return self._set_review_state(vacancy_id, "disliked")
+
+    def liked_vacancies(self) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM vacancies
+                WHERE review_state = 'liked'
+                ORDER BY datetime(COALESCE(saved_at, reviewed_at, created_at)) DESC, id DESC
+                """
+            ).fetchall()
+        return list(rows)
+
+    def delete_liked_vacancy(self, vacancy_id: int) -> bool:
+        timestamp = now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies
+                SET review_state = 'deleted',
+                    deleted_at = COALESCE(deleted_at, ?)
+                WHERE id = ?
+                  AND review_state = 'liked'
+                """,
+                (timestamp, vacancy_id),
+            )
+        return cursor.rowcount > 0
+
+    def latest_rejected(self, limit: int = 10) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM rejected_vacancies
+                ORDER BY datetime(last_seen_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return list(rows)
 
     def find_duplicate(self, vacancy: Vacancy, similarity_threshold: float = 0.85) -> dict[str, Any] | None:
         exact_hash = vacancy.content_hash_exact or vacancy.content_hash
@@ -183,7 +470,7 @@ class Database:
             if exact_hash:
                 row = connection.execute(
                     """
-                    SELECT id, source, source_type, sent
+                    SELECT id, source, source_type, sent, review_state
                     FROM vacancies
                     WHERE content_hash = ? OR content_hash_exact = ?
                     LIMIT 1
@@ -193,10 +480,24 @@ class Database:
                 if row:
                     return self._duplicate_result(row, vacancy, "exact")
 
+            parent_hash = vacancy.parent_content_hash or str(vacancy.metadata.get("parent_content_hash", ""))
+            if parent_hash:
+                row = connection.execute(
+                    """
+                    SELECT id, source, source_type, sent, review_state
+                    FROM vacancies
+                    WHERE content_hash = ? OR content_hash_exact = ?
+                    LIMIT 1
+                    """,
+                    (parent_hash, parent_hash),
+                ).fetchone()
+                if row:
+                    return self._duplicate_result(row, vacancy, "parent-post")
+
             if normalized_hash:
                 row = connection.execute(
                     """
-                    SELECT id, source, source_type, sent
+                    SELECT id, source, source_type, sent, review_state
                     FROM vacancies
                     WHERE source_type = ?
                       AND content_hash_normalized = ?
@@ -209,7 +510,7 @@ class Database:
 
             rows = connection.execute(
                 """
-                SELECT id, source, source_type, sent, content_normalized
+                SELECT id, source, source_type, sent, review_state, content_normalized
                 FROM vacancies
                 WHERE source_type = ?
                   AND content_normalized IS NOT NULL
@@ -234,6 +535,7 @@ class Database:
             "id": row["id"],
             "kind": kind,
             "sent": bool(row["sent"]),
+            "review_state": row["review_state"] if "review_state" in row.keys() else "",
             "cross_channel": vacancy.source_type == "telegram" and row["source"] != vacancy.source,
             "source": row["source"],
         }
@@ -242,8 +544,7 @@ class Database:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, source, source_type, title, text, link, published_at,
-                       score, created_at, sent
+                SELECT *
                 FROM vacancies
                 ORDER BY datetime(created_at) DESC, id DESC
                 LIMIT ?
@@ -274,7 +575,11 @@ class Database:
                 SELECT
                     COUNT(*) AS total_saved,
                     COALESCE(SUM(sent), 0) AS sent_saved,
-                    COALESCE(SUM(CASE WHEN sent = 0 THEN 1 ELSE 0 END), 0) AS unsent_saved
+                    COALESCE(SUM(CASE WHEN sent = 0 THEN 1 ELSE 0 END), 0) AS unsent_saved,
+                    COALESCE(SUM(CASE WHEN review_state = 'pending' THEN 1 ELSE 0 END), 0) AS pending_review,
+                    COALESCE(SUM(CASE WHEN review_state = 'liked' THEN 1 ELSE 0 END), 0) AS liked_saved,
+                    COALESCE(SUM(CASE WHEN review_state = 'disliked' THEN 1 ELSE 0 END), 0) AS disliked_reviewed,
+                    COALESCE(SUM(CASE WHEN review_state = 'deleted' THEN 1 ELSE 0 END), 0) AS deleted_saved
                 FROM vacancies
                 """
             ).fetchone()
@@ -285,6 +590,9 @@ class Database:
                 GROUP BY source_type
                 """
             ).fetchall()
+            rejected_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM rejected_vacancies"
+            ).fetchone()
 
         stats = {row["key"]: row["value"] for row in stat_rows}
         stats["telegram_saved"] = 0
@@ -300,6 +608,11 @@ class Database:
                 "total_saved": int(vacancy_counts["total_saved"]),
                 "sent_saved": int(vacancy_counts["sent_saved"]),
                 "unsent_saved": int(vacancy_counts["unsent_saved"]),
+                "pending_review": int(vacancy_counts["pending_review"]),
+                "liked_saved": int(vacancy_counts["liked_saved"]),
+                "disliked_reviewed": int(vacancy_counts["disliked_reviewed"]),
+                "deleted_saved": int(vacancy_counts["deleted_saved"]),
+                "rejected_saved": int(rejected_count["count"]),
             }
         )
         return stats

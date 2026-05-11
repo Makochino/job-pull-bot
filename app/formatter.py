@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from . import extraction
 from .utils import Vacancy, clean_text_for_display, clean_vacancy_text, truncate_text
 
 
@@ -34,6 +35,18 @@ def _clean_field(value: str | None, limit: int = 220) -> str:
     if not value:
         return "not specified"
     return truncate_text(value, limit)
+
+
+def _row_get(row: Any, key: str, default: Any = "") -> Any:
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _known(value: str | None) -> bool:
+    return bool(value and value != "not specified")
 
 
 def _line_with_patterns(text: str, patterns: list[str], limit: int = 180) -> str:
@@ -99,7 +112,32 @@ def format_vacancy(vacancy: Vacancy) -> str:
 def format_telegram_vacancy(vacancy: Vacancy) -> str:
     text = truncate_text(clean_text_for_display(vacancy.text), 1900)
     link = vacancy.link or "not available"
+    role = vacancy.role or vacancy.vacancy_type or extraction.detect_role_from_text(vacancy.text)
+    salary = vacancy.salary if _known(vacancy.salary) else extraction.extract_salary(vacancy.text)
+    schedule = vacancy.schedule if _known(vacancy.schedule) else extraction.extract_schedule(vacancy.text)
+    location = vacancy.location if _known(vacancy.location) else extraction.extract_location(vacancy.text)
+    contact = vacancy.contact if _known(vacancy.contact) else extraction.extract_contact(vacancy.text)
+    age = vacancy.age_requirement if _known(vacancy.age_requirement) else extraction.extract_age_requirement(vacancy.text)
+    experience = (
+        vacancy.experience_requirement
+        if _known(vacancy.experience_requirement)
+        else extraction.extract_experience_requirement(vacancy.text)
+    )
+    gender = (
+        vacancy.gender_requirement
+        if _known(vacancy.gender_requirement)
+        else extraction.extract_gender_requirement(vacancy.text)
+    )
     message = f"""⭐ <b>Relevance:</b> {vacancy.score}/10
+
+💼 <b>Role:</b> {_html(extraction.role_display(role))}
+💰 <b>Salary:</b> {_html(salary)}
+🕒 <b>Schedule:</b> {_html(schedule)}
+📍 <b>Location:</b> {_html(location)}
+🎂 <b>Age:</b> {_html(age)}
+🧰 <b>Experience:</b> {_html(experience)}
+⚧ <b>Gender:</b> {_html(gender)}
+☎️ <b>Contact:</b> {_html(contact)}
 
 <b>Text:</b>
 {_html(text)}
@@ -112,15 +150,31 @@ def format_telegram_vacancy(vacancy: Vacancy) -> str:
 def format_website_vacancy(vacancy: Vacancy) -> str:
     title = _clean_field(vacancy.title or "Untitled", 220)
     text = clean_vacancy_text(vacancy.text)
-    salary = extract_salary(text)
-    schedule = extract_schedule(text)
-    workplace = extract_location("\n".join([vacancy.title or "", text]))
-    phone = extract_phone(text)
+    role_text = "\n".join([vacancy.title or "", text])
+    role = vacancy.role or vacancy.vacancy_type or extraction.detect_role_from_text(role_text)
+    salary = vacancy.salary if _known(vacancy.salary) else extraction.extract_salary(text)
+    schedule = vacancy.schedule if _known(vacancy.schedule) else extraction.extract_schedule(text)
+    workplace = vacancy.location if _known(vacancy.location) else extraction.extract_location(role_text)
+    phone = vacancy.contact if _known(vacancy.contact) else extraction.extract_contact(text)
+    age = vacancy.age_requirement if _known(vacancy.age_requirement) else extraction.extract_age_requirement(text)
+    experience = (
+        vacancy.experience_requirement
+        if _known(vacancy.experience_requirement)
+        else extraction.extract_experience_requirement(text)
+    )
+    gender = (
+        vacancy.gender_requirement
+        if _known(vacancy.gender_requirement)
+        else extraction.extract_gender_requirement(text)
+    )
     link = vacancy.link or "not available"
 
     message = f"""🌐 <b>Website vacancy</b>
 
 ⭐ <b>Relevance:</b> {vacancy.score}/10
+
+💼 <b>Role:</b>
+{_html(extraction.role_display(role))}
 
 💼 <b>Title:</b>
 {_html(title)}
@@ -133,6 +187,15 @@ def format_website_vacancy(vacancy: Vacancy) -> str:
 
 📍 <b>Workplace:</b>
 {_html(workplace)}
+
+🎂 <b>Age:</b>
+{_html(age)}
+
+🧰 <b>Experience:</b>
+{_html(experience)}
+
+⚧ <b>Gender:</b>
+{_html(gender)}
 
 ☎️ <b>Phone:</b>
 {_html(phone)}
@@ -169,13 +232,142 @@ def format_latest(rows: list[Any]) -> str:
     return _clip_message("\n".join(lines))
 
 
+def _format_db_vacancy_card(row: Any, header: str, text_limit: int = 900) -> str:
+    raw_title = str(_row_get(row, "title", "Untitled"))
+    raw_text = str(_row_get(row, "text", ""))
+    role_text = "\n".join([raw_title, raw_text])
+    role = str(
+        _row_get(row, "extracted_role", "")
+        or _row_get(row, "vacancy_type", "")
+        or extraction.detect_role_from_text(role_text)
+        or "other"
+    )
+    title = _clean_field(raw_title, 160)
+    salary_value = str(_row_get(row, "extracted_salary", ""))
+    schedule_value = str(_row_get(row, "extracted_schedule", ""))
+    location_value = str(_row_get(row, "extracted_location", ""))
+    contact_value = str(_row_get(row, "extracted_contact", ""))
+    age_value = str(_row_get(row, "extracted_age_requirement", ""))
+    experience_value = str(_row_get(row, "extracted_experience_requirement", ""))
+    gender_value = str(_row_get(row, "extracted_gender_requirement", ""))
+    salary = _clean_field(salary_value if _known(salary_value) else extraction.extract_salary(raw_text), 180)
+    schedule = _clean_field(schedule_value if _known(schedule_value) else extraction.extract_schedule(raw_text), 180)
+    location = _clean_field(location_value if _known(location_value) else extraction.extract_location(role_text), 180)
+    contact = _clean_field(contact_value if _known(contact_value) else extraction.extract_contact(raw_text), 160)
+    age = _clean_field(age_value if _known(age_value) else extraction.extract_age_requirement(raw_text), 160)
+    experience = _clean_field(
+        experience_value if _known(experience_value) else extraction.extract_experience_requirement(raw_text),
+        180,
+    )
+    gender = _clean_field(gender_value if _known(gender_value) else extraction.extract_gender_requirement(raw_text), 160)
+    text = truncate_text(clean_text_for_display(raw_text), text_limit)
+    link = str(_row_get(row, "link", "") or "not available")
+    source = str(_row_get(row, "source", "not specified"))
+    score = int(_row_get(row, "score", 0) or 0)
+
+    return _clip_message(
+        f"{header}\n\n"
+        f"⭐ <b>Relevance:</b> {score}/10\n"
+        f"💼 <b>Role:</b> {_html(extraction.role_display(role))}\n"
+        f"💼 <b>Title:</b> {_html(title)}\n"
+        f"💰 <b>Salary:</b> {_html(salary)}\n"
+        f"🕒 <b>Schedule:</b> {_html(schedule)}\n"
+        f"📍 <b>Location:</b> {_html(location)}\n"
+        f"🎂 <b>Age:</b> {_html(age)}\n"
+        f"🧰 <b>Experience:</b> {_html(experience)}\n"
+        f"⚧ <b>Gender:</b> {_html(gender)}\n"
+        f"☎️ <b>Contact:</b> {_html(contact)}\n"
+        f"📣 <b>Source:</b> {_html(source)}\n\n"
+        f"<b>Text:</b>\n{_html(text)}\n\n"
+        f"🔗 <b>Link:</b>\n{_html(link)}"
+    )
+
+
+def format_review_vacancy(row: Any, left_count: int) -> str:
+    header = f"🧾 <b>Vacancy review</b>\nVacancies left: <b>{left_count}</b>"
+    return _format_db_vacancy_card(row, header=header, text_limit=1200)
+
+
+def format_saved_vacancies(rows: list[Any]) -> list[str]:
+    if not rows:
+        return [
+            "❤️ <b>No saved vacancies yet.</b>\n\n"
+            "Like vacancies during review and they will appear here."
+        ]
+
+    total = len(rows)
+    cards = [
+        _format_db_vacancy_card(
+            row,
+            header=f"❤️ <b>Saved vacancy #{index} of {total}</b>",
+            text_limit=650,
+        )
+        for index, row in enumerate(rows, start=1)
+    ]
+
+    chunks: list[str] = []
+    current = "❤️ <b>Saved vacancies</b>"
+    for card in cards:
+        candidate = f"{current}\n\n{card}" if current else card
+        if len(candidate) > TELEGRAM_MESSAGE_LIMIT - 100:
+            chunks.append(_clip_message(current))
+            current = card
+        else:
+            current = candidate
+    if current:
+        chunks.append(_clip_message(current))
+    return chunks
+
+
+def format_deleted_saved_vacancy(row: Any, number: int) -> str:
+    title = _clean_field(str(_row_get(row, "title", "Untitled")), 120)
+    role = extraction.role_display(str(_row_get(row, "extracted_role", "") or "other"))
+    return f"🗑 Deleted saved vacancy #{number}: <b>{_html(role)}</b> - {_html(title)}"
+
+
+def format_no_pending_review() -> str:
+    return "✅ <b>No more vacancies left to review.</b>"
+
+
+def format_rejected_vacancies(rows: list[Any]) -> str:
+    if not rows:
+        return "🧾 <b>No rejected vacancies have been recorded yet.</b>"
+
+    lines = ["🧾 <b>Recently rejected vacancies</b>"]
+    for index, row in enumerate(rows, start=1):
+        role = extraction.role_display(str(_row_get(row, "extracted_role", "") or "other"))
+        reason = _clean_field(str(_row_get(row, "reject_reason", "")), 180)
+        text = truncate_text(clean_text_for_display(str(_row_get(row, "text", ""))), 420)
+        score = int(_row_get(row, "score", 0) or 0)
+        source = _clean_field(str(_row_get(row, "source", "")), 90)
+        matched = _clean_field(str(_row_get(row, "matched_role_keywords", "[]")), 160)
+        seen_count = int(_row_get(row, "seen_count", 1) or 1)
+        link = str(_row_get(row, "link", "") or "not available")
+        lines.append(
+            f"\n<b>{index}. {role}</b>\n"
+            f"Reason: {_html(reason)}\n"
+            f"Score: <b>{score}/10</b>\n"
+            f"Matched: {_html(matched)}\n"
+            f"Source: {_html(source)} | Seen: <b>{seen_count}</b>\n"
+            f"Link: {_html(link)}\n"
+            f"{_html(text)}"
+        )
+    return _clip_message("\n".join(lines))
+
+
 def format_stats(stats: dict[str, Any]) -> str:
     return (
         "📊 <b>Stats</b>\n\n"
         f"Telegram vacancies saved: <b>{stats.get('telegram_saved', 0)}</b>\n"
         f"Website vacancies saved: <b>{stats.get('website_saved', 0)}</b>\n"
         f"Total saved: <b>{stats.get('total_saved', 0)}</b>\n"
-        f"Sent: <b>{stats.get('sent_total', stats.get('sent_saved', 0))}</b>\n"
+        f"Pending review: <b>{stats.get('pending_review', 0)}</b>\n"
+        f"Liked / saved: <b>{stats.get('liked_saved', 0)}</b>\n"
+        f"Disliked / reviewed: <b>{stats.get('disliked_reviewed', 0)}</b>\n"
+        f"Deleted saved: <b>{stats.get('deleted_saved', 0)}</b>\n"
+        f"Rejected audit rows: <b>{stats.get('rejected_saved', 0)}</b>\n"
+        f"Sent by old flow: <b>{stats.get('sent_total', stats.get('sent_saved', 0))}</b>\n"
+        f"Queued for review: <b>{stats.get('queued_total', 0)}</b>\n"
         f"Duplicates: <b>{stats.get('duplicates_total', 0)}</b>\n"
         f"Cross-channel duplicates: <b>{stats.get('cross_channel_duplicates_total', 0)}</b>\n"
         f"Already sent: <b>{stats.get('already_sent_total', 0)}</b>\n"
@@ -217,7 +409,7 @@ def format_settings(config: dict[str, Any]) -> str:
 
 
 def format_no_more_vacancies() -> str:
-    return "✅ <b>No more vacancies.</b>"
+    return "✅ <b>No more vacancies left to review.</b>"
 
 
 def format_pagination_prompt(sent: int, total: int) -> str:
@@ -255,8 +447,8 @@ def format_tg_pull_report(
         f"Rejected: <b>{hard_rejected}</b>",
         f"Duplicates: <b>{duplicates}</b>",
         f"Cross-channel duplicates: <b>{cross_channel_duplicates}</b>",
-        f"Already sent: <b>{already_sent}</b>",
-        f"Sent now: <b>{sent_now}</b>",
+        f"Already known/reviewed: <b>{already_sent}</b>",
+        f"Queued now: <b>{sent_now}</b>",
         f"Errors: <b>{source_errors}</b>",
     ]
     if channels_empty:
@@ -293,10 +485,10 @@ def format_sites_pull_report(
         f"Rejected: <b>{hard_rejected}</b>",
         f"Detail pages fetched: <b>{detail_pages_fetched}</b>",
         f"Duplicates: <b>{duplicates}</b>",
-        f"Already sent: <b>{already_sent}</b>",
+        f"Already known/reviewed: <b>{already_sent}</b>",
         f"New sendable: <b>{new_sendable}</b>",
-        f"Sent now: <b>{sent_now}</b>",
-        f"Pending in this batch: <b>{pending}</b>",
+        f"Queued now: <b>{sent_now}</b>",
+        f"Pending review in this batch: <b>{pending}</b>",
         f"Errors: <b>{source_errors}</b>",
     ]
     if matched == 0:

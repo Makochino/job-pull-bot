@@ -50,62 +50,60 @@ ROLE_GROUPS: tuple[RoleGroup, ...] = (
             "ранеры",
             "помощник официанта",
             "помічник офіціанта",
+            "помощник в зал",
+            "помічник у зал",
         ),
     ),
     RoleGroup("hostess", "Hostess", ("hostess", "хостес")),
-    RoleGroup(
-        "bartender",
-        "Bartender",
-        ("bartender", "бармен", "бармены", "бармени", "барменов"),
-    ),
-    RoleGroup("barista", "Barista", ("barista", "бариста", "баристы", "баристи")),
-    RoleGroup(
-        "kitchen helper",
-        "Kitchen helper",
-        (
-            "помощник кухни",
-            "помічник кухаря",
-            "кухонный работник",
-            "кухонний працівник",
-        ),
-    ),
-    RoleGroup(
-        "restaurant staff",
-        "Restaurant staff",
-        (
-            "restaurant staff",
-            "cafe staff",
-            "персонал ресторана",
-            "персонал ресторану",
-            "персонал кафе",
-            "помощник в ресторан",
-            "помічник в ресторан",
-            "restaurant assistant",
-            "менеджер ресторана",
-            "менеджер ресторану",
-            "администратор ресторана",
-            "адміністратор ресторану",
-            "service manager restaurant",
-            "service manager cafe",
-        ),
-    ),
 )
 
 OTHER_ROLE_TERMS: tuple[str, ...] = (
+    "bartender",
+    "barman",
+    "бармен",
+    "барменка",
+    "бармены",
+    "бармени",
+    "барменов",
+    "barista",
+    "бариста",
+    "баристы",
+    "баристи",
+    "cook",
+    "chef",
+    "kitchen helper",
+    "kitchen assistant",
+    "dishwasher",
+    "cleaner",
+    "maid",
+    "housekeeper",
     "заготовщица",
     "заготовщик",
     "повар",
     "повара",
     "кухар",
     "кухарі",
+    "помощник кухни",
+    "помічник кухаря",
+    "помощник повара",
+    "помічник кухаря",
+    "помощник повара",
+    "кухонный работник",
+    "кухонний працівник",
     "порто",
     "посудомой",
+    "посудомойщик",
     "посудомий",
+    "посудомийник",
     "мойщ",
+    "мойщица",
     "прибираль",
     "уборщ",
+    "уборщица",
+    "покоївка",
     "администратор",
     "адміністратор",
+    "administrator",
     "кассир",
     "касир",
     "продавец",
@@ -116,6 +114,124 @@ OTHER_ROLE_TERMS: tuple[str, ...] = (
     "доставка",
     "курьер",
     "кур'єр",
+    "грузчик",
+    "вантажник",
+    "restaurant staff",
+    "cafe staff",
+    "персонал ресторана",
+    "персонал ресторану",
+    "персонал кафе",
+    "помощник в ресторан",
+    "помічник в ресторан",
+    "restaurant assistant",
+    "менеджер ресторана",
+    "менеджер ресторану",
+    "service manager restaurant",
+    "service manager cafe",
+)
+
+EXPERIENCE_NOT_REQUIRED_PATTERNS: tuple[str, ...] = (
+    r"\bбез\s+опыта\b",
+    r"\bбез\s+досвiду\b",
+    r"\bбез\s+досвіду\b",
+    r"\bможно\s+без\s+опыта\b",
+    r"\bможна\s+без\s+досвiду\b",
+    r"\bможна\s+без\s+досвіду\b",
+    r"\bможливо\s+без\s+досвiду\b",
+    r"\bможливо\s+без\s+досвіду\b",
+    r"\bопыт\s+не\s+обязател(?:ен|ьный|ьна|ьно)\b",
+    r"\bопыт\s+работы\s+не\s+обязател(?:ен|ьный|ьна|ьно)\b",
+    r"\bопыт\s+необязател(?:ен|ьный|ьна|ьно)\b",
+    r"\bдосвiд\s+не\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвід\s+не\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвiд\s+роботи\s+не\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвід\s+роботи\s+не\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвiд\s+необов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвід\s+необов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bno\s+experience\b",
+    r"\bexperience\s+(?:is\s+)?not\s+required\b",
+)
+
+EXPERIENCE_SOFT_PATTERNS: tuple[str, ...] = (
+    r"\bдосвiд\s+бажан(?:ий|о|а)\b",
+    r"\bдосвід\s+бажан(?:ий|о|а)\b",
+    r"\bбажано\s+з\s+досвiдом\b",
+    r"\bбажано\s+з\s+досвідом\b",
+    r"\bопыт\s+будет\s+плюсом\b",
+    r"\bжелательно\s+с\s+опытом\b",
+    r"\bбуде\s+перевагою\b",
+    r"\bбудет\s+преимуществом\b",
+    r"\bexperience\s+(?:is\s+)?(?:a\s+)?plus\b",
+)
+
+EXPERIENCE_REQUIRED_PATTERNS: tuple[str, ...] = (
+    r"\bопыт\s+работы\s+от\b",
+    r"\bдосвiд\s+роботи\s+вiд\b",
+    r"\bдосвід\s+роботи\s+від\b",
+    r"\b(?:опыт|досвiд|досвід)\s+от\b",
+    r"\b(?:досвiд|досвід)\s+вiд\b",
+    r"\b(?:досвiд|досвід)\s+від\b",
+    r"\b(?:от|від|вiд)\s*1\s*(?:года|год|лет|року|рік|рокiв|років)\b",
+    r"\b(?:от|від|вiд)\s*\d+\s*(?:года|год|лет|року|рік|рокiв|років)\b",
+    r"\b(?:от|від|вiд)\s*(?:года|року)\b",
+    r"\bобязательный\s+опыт\b",
+    r"\bопыт\s+обязател(?:ен|ьный|ьна|ьно)\b",
+    r"\bопыт\s+работы\s+обязател(?:ен|ьный|ьна|ьно)\b",
+    r"\bобов[ʼ'`’]?язков(?:ий|о|а)\s+досвiд\b",
+    r"\bобов[ʼ'`’]?язков(?:ий|о|а)\s+досвід\b",
+    r"\bдосвiд\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвід\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвiд\s+роботи\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bдосвід\s+роботи\s+обов[ʼ'`’]?язков(?:ий|о|а)\b",
+    r"\bс\s+опытом\b",
+    r"\bз\s+досвiдом\b",
+    r"\bз\s+досвідом\b",
+)
+
+AGE_17_ALLOWED_PATTERNS: tuple[str, ...] = (
+    r"\b17\s*\+",
+    r"\b(?:с|з|от|від|вiд)\s*17\s*(?:лет|років|рокiв|року)?\b",
+    r"\b(?:можно|можна)\s+(?:с|з)\s*17\b",
+)
+
+AGE_18_REJECT_PATTERNS: tuple[str, ...] = (
+    r"\b18\s*\+",
+    r"\b(?:строго|тільки|тiльки|только|лише)?\s*(?:с|з|от|від|вiд)\s*18\s*(?:лет|років|рокiв|року)?\b",
+)
+
+FEMALE_ONLY_PATTERNS: tuple[str, ...] = (
+    r"\b(?:только|тільки|тiльки|лише)\s+(?:девушк[аиу]|дівчин[аиу]|дiвчин[аиу]|дівчат[а]?|дiвчат[а]?|женщин[ау]?|жінк[ау]?|жiнк[ау]?)\b",
+    r"\b(?:нужн[аы]?|требует(?:ся|ься)|потрібн[аiі]?|потрiбн[аiі]?|потрібні|потрiбнi|шукаємо|ищем)\s+(?:девушк[ауи]?|дівчин[ауи]?|дiвчин[ауи]?|дівчат|дiвчат|женщин[ау]?|жінк[ау]?|жiнк[ау]?)\b",
+    r"\b(?:девушк[аиу]|дівчин[аиу]|дiвчин[аиу]|женщин[ау]?|жінк[ау]?|жiнк[ау]?)\s+(?:только|тільки|тiльки|лише)\b",
+    r"\bженского\s+пола\b",
+    r"\bжіночої\s+статі\b",
+    r"\bжiночої\s+статi\b",
+    r"\bженщина\b",
+    r"\bжінка\b",
+    r"\bжiнка\b",
+    r"\bдевушка\b",
+    r"\bдівчина\b",
+    r"\bдiвчина\b",
+)
+
+MALE_OR_OPEN_GENDER_TERMS: tuple[str, ...] = (
+    "парень",
+    "парни",
+    "хлопець",
+    "хлопці",
+    "хлопцi",
+    "мужчина",
+    "мужчины",
+    "чоловік",
+    "чоловiк",
+    "чоловіки",
+    "чоловiки",
+    "мужской пол",
+    "чоловіча стать",
+    "чоловiча стать",
+    "официант/официантка",
+    "офіціант/офіціантка",
+    "офiцiант/офiцiантка",
 )
 
 
@@ -126,6 +242,9 @@ def normalize_match_text(value: str) -> str:
         .replace("є", "е")
         .replace("і", "i")
         .replace("ї", "i")
+        .replace("’", "'")
+        .replace("ʼ", "'")
+        .replace("`", "'")
     )
 
 
@@ -149,6 +268,14 @@ def matched_role_keywords(text: str) -> list[str]:
     return keywords
 
 
+def vacancy_filter_text(vacancy: Vacancy) -> str:
+    return str(vacancy.metadata.get("filter_text") or vacancy.text or "")
+
+
+def has_target_role(text: str) -> bool:
+    return bool(_matched_role_groups(text))
+
+
 def detect_role_from_text(text: str) -> str:
     matches = _matched_role_groups(text)
     return matches[0][0].label if matches else "other"
@@ -165,6 +292,24 @@ def _line_has_any_role(line: str) -> bool:
     if _matched_role_groups(line):
         return True
     return any(_contains_phrase(line, term) for term in OTHER_ROLE_TERMS)
+
+
+def _line_has_other_role_for_group(line: str, group: RoleGroup) -> bool:
+    role_matches = _matched_role_groups(line)
+    if any(matched_group.label != group.label for matched_group, _ in role_matches):
+        return True
+    return any(_contains_phrase(line, term) for term in OTHER_ROLE_TERMS)
+
+
+def _candidate_role_segment_lines(lines: list[str], group: RoleGroup) -> list[str]:
+    candidate_lines: list[str] = []
+    for line in lines:
+        if _line_has_other_role_for_group(line, group):
+            if any(_contains_phrase(line, term) for term in group.terms):
+                candidate_lines.append(group.display)
+            continue
+        candidate_lines.append(line)
+    return candidate_lines
 
 
 def _looks_like_global_detail(line: str) -> bool:
@@ -203,7 +348,12 @@ def split_vacancy_candidates(vacancy: Vacancy) -> list[Vacancy]:
         return [vacancy]
 
     lines = vacancy.text.splitlines()
-    if len([line for line in lines if line.strip()]) < 2:
+    non_empty_lines = [line for line in lines if line.strip()]
+    if len(non_empty_lines) < 2 and not (
+        non_empty_lines
+        and _matched_role_groups(non_empty_lines[0])
+        and any(_contains_phrase(non_empty_lines[0], term) for term in OTHER_ROLE_TERMS)
+    ):
         annotate_vacancy_fields(vacancy)
         return [vacancy]
 
@@ -225,7 +375,14 @@ def split_vacancy_candidates(vacancy: Vacancy) -> list[Vacancy]:
         for _, matches in target_markers
         for group, _ in matches
     }
-    has_mixed_roles = len(markers) > 1 or len(target_labels) > 1
+    has_mixed_roles = (
+        len(markers) > 1
+        or len(target_labels) > 1
+        or any(
+            matches and any(_line_has_other_role_for_group(lines[index], group) for group, _ in matches)
+            for index, matches in target_markers
+        )
+    )
     if not has_mixed_roles:
         matches = target_markers[0][1]
         group, terms = matches[0]
@@ -257,21 +414,15 @@ def split_vacancy_candidates(vacancy: Vacancy) -> list[Vacancy]:
         for group, terms in matches:
             candidate_index += 1
             candidate_lines = list(shared_prefix)
-            candidate_lines.extend(role_segment)
+            candidate_lines.extend(_candidate_role_segment_lines(role_segment, group))
             for line in global_trailing:
                 if line not in candidate_lines:
                     candidate_lines.append(line)
             candidate_text = _clean_join(candidate_lines) or vacancy.text
+            source_key = str(vacancy.metadata.get("source_key") or vacancy.content_hash_exact or vacancy.content_hash)
+            dedupe_key = "|".join([source_key, "role", group.label])
             exact_hash = sha256_text(
-                "|".join(
-                    [
-                        vacancy.content_hash_exact or vacancy.content_hash,
-                        "role",
-                        group.label,
-                        str(start),
-                        str(candidate_index),
-                    ]
-                )
+                dedupe_key
             )
             normalized_text = normalize_text_for_hashing(
                 "\n".join([group.display, candidate_text, vacancy.link or ""])
@@ -280,7 +431,7 @@ def split_vacancy_candidates(vacancy: Vacancy) -> list[Vacancy]:
                 source=vacancy.source,
                 source_type=vacancy.source_type,
                 title=group.display,
-                text=candidate_text,
+                text=vacancy.text,
                 link=vacancy.link,
                 published_at=vacancy.published_at,
                 score=vacancy.score,
@@ -295,6 +446,9 @@ def split_vacancy_candidates(vacancy: Vacancy) -> list[Vacancy]:
                 matched_role_keywords=terms,
                 metadata={
                     **vacancy.metadata,
+                    "source_key": dedupe_key,
+                    "dedupe_key": dedupe_key,
+                    "filter_text": candidate_text,
                     "parent_content_hash": vacancy.content_hash_exact or vacancy.content_hash,
                     "role_marker_line": start,
                     "role_candidate_index": candidate_index,
@@ -317,6 +471,87 @@ def _line_with_patterns(text: str, patterns: list[str], limit: int = 180) -> str
         if any(re.search(pattern, line, flags=re.IGNORECASE | re.UNICODE) for pattern in patterns):
             return truncate_text(line, limit)
     return ""
+
+
+def _first_pattern_match(text: str, patterns: tuple[str, ...] | list[str], limit: int = 180) -> str:
+    normalized = normalize_match_text(text)
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE)
+        if match:
+            return truncate_text(text[match.start() : match.end()].strip(), limit)
+    return ""
+
+
+def _line_has_schedule_time(line: str) -> bool:
+    normalized = normalize_match_text(line)
+    return bool(
+        re.search(r"\b\d{1,2}\s*[:.]\s*\d{2}\b", normalized)
+        or re.search(r"\b(?:с|з)\s*\d{1,2}\s*(?:до|-|–|—)\s*\d{1,2}\b", normalized)
+        or re.search(r"\bграфик|графiк|графік|schedule|смен", normalized)
+    )
+
+
+def _experience_line_status(line: str) -> str:
+    normalized = normalize_match_text(line)
+    has_negation = any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in EXPERIENCE_NOT_REQUIRED_PATTERNS)
+    has_soft_requirement = any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in EXPERIENCE_SOFT_PATTERNS)
+    has_required = any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in EXPERIENCE_REQUIRED_PATTERNS)
+    if has_required and not has_negation:
+        if has_soft_requirement:
+            return "soft"
+        return "required"
+    if has_negation:
+        return "not_required"
+    if has_soft_requirement:
+        return "soft"
+    return "unknown"
+
+
+def experience_requirement_status(text: str) -> str:
+    saw_not_required = False
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        status = _experience_line_status(line)
+        if status == "required":
+            return "required"
+        if status == "not_required":
+            saw_not_required = True
+    return "not_required" if saw_not_required else "unknown"
+
+
+def has_required_experience(text: str) -> bool:
+    return experience_requirement_status(text) == "required"
+
+
+def age_allows_17(text: str) -> bool:
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        if _line_has_schedule_time(line):
+            continue
+        normalized = normalize_match_text(line)
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in AGE_17_ALLOWED_PATTERNS):
+            return True
+    return False
+
+
+def has_age_18_restriction(text: str) -> bool:
+    if age_allows_17(text):
+        return False
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        if _line_has_schedule_time(line):
+            continue
+        normalized = normalize_match_text(line)
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in AGE_18_REJECT_PATTERNS):
+            return True
+    return False
+
+
+def has_female_only_requirement(text: str) -> bool:
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        normalized = normalize_match_text(line)
+        if any(normalize_match_text(term) in normalized for term in MALE_OR_OPEN_GENDER_TERMS):
+            continue
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE) for pattern in FEMALE_ONLY_PATTERNS):
+            return True
+    return False
 
 
 def extract_salary(text: str) -> str:
@@ -421,38 +656,49 @@ def extract_location(text: str) -> str:
 
 
 def extract_age_requirement(text: str) -> str:
-    patterns = [
-        r"\b(?:от|від)\s*1[678]\b.{0,80}",
-        r"\b(?:до)\s*[2-6]\d\b.{0,80}",
-        r"\b1[678]\s*\+.{0,80}",
-        r"\b(?:от|від)\s*\d{2}\s*(?:до|-|–|—)\s*\d{2}\b.{0,80}",
-    ]
-    found = _line_with_patterns(text, patterns)
-    return found or "not specified"
+    patterns = (
+        r"\b1[678]\s*\+",
+        r"\b(?:от|від|вiд)\s*1[678]\s*(?:лет|років|рокiв|року)?\b",
+        r"\b(?:до)\s*[2-6]\d\s*(?:лет|років|рокiв|року)\b",
+        r"\b(?:от|від|вiд)\s*\d{2}\s*(?:до|-|–|—)\s*\d{2}\s*(?:лет|років|рокiв|року)?\b",
+        r"\b(?:возраст|вiк|вік)\b.{0,80}",
+    )
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        if _line_has_schedule_time(line):
+            continue
+        found = _first_pattern_match(line, patterns)
+        if found:
+            return found
+    return "not specified"
 
 
 def extract_experience_requirement(text: str) -> str:
-    patterns = [
-        r"\b(?:опыт|досвід|experience|стаж)\b.{0,140}",
-        r"\b(?:без опыта|без досвіду|no experience)\b.{0,120}",
-    ]
-    found = _line_with_patterns(text, patterns)
-    return found or "not specified"
+    lines = clean_vacancy_text(text).splitlines() or [text]
+    for line in lines:
+        if _experience_line_status(line) == "required":
+            return truncate_text(line, 180)
+    for line in lines:
+        if _experience_line_status(line) == "not_required":
+            return truncate_text(line, 180)
+    return "not specified"
 
 
 def extract_gender_requirement(text: str) -> str:
-    patterns = [
-        r"\b(?:девушка|девушки|девушек|дівчина|дівчата|дівчат|женщина|жінка)\b.{0,120}",
-        r"\b(?:парень|парни|мужчина|мужчины|хлопець|хлопці|юноша)\b.{0,120}",
-        r"\b(?:только девушки|тільки дівчата|только парни|тільки хлопці)\b.{0,120}",
-    ]
-    found = _line_with_patterns(text, patterns)
-    return found or "not specified"
+    patterns = (
+        r"\b(?:только|лише|тільки)\s+(?:девушк[аи]|дівчин[аи]|дівчата|парн[иия]|хлопц[іiя]|хлопець|мужчин[аы]|жінк[аи])\b",
+        r"\b(?:нужн[аы]?|требует(?:ся|ься)|потрібн[аiі]?|шукаємо|ищем)\s+(?:девушк[ауи]?|дівчин[ауи]?|дівчат|парн[яеи]?|хлопц[яіi]?|хлопець|мужчин[ау]?|женщин[ау]?|жінк[ау]?)\b",
+        r"\((?:девушк[аи]|дівчин[аи]|дівчата|парн[иия]|хлопц[іiя]|хлопець|мужчин[аы]|жінк[аи])\)",
+    )
+    for line in clean_vacancy_text(text).splitlines() or [text]:
+        found = _first_pattern_match(line, patterns, limit=80)
+        if found:
+            return found.strip("() ")
+    return "not specified"
 
 
 def annotate_vacancy_fields(vacancy: Vacancy, full_text: str | None = None) -> Vacancy:
-    role_text = "\n".join([vacancy.title or "", vacancy.text or ""])
-    full_text = full_text or role_text
+    role_text = "\n".join([vacancy.title or "", vacancy_filter_text(vacancy)])
+    full_text = full_text or vacancy.text or role_text
 
     if not vacancy.role:
         vacancy.role = detect_role_from_text(role_text)

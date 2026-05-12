@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon.errors import RPCError
@@ -9,11 +10,11 @@ from telethon.tl.custom import Message
 from .utils import (
     SourceResult,
     Vacancy,
-    clean_text_for_display,
     first_line_title,
     normalize_for_hash,
     normalize_text_for_hashing,
     normalized_content_hash,
+    preserve_original_text,
     sha256_text,
 )
 
@@ -53,7 +54,7 @@ def _post_link(channel: str, entity: object, message_id: int) -> str:
 
 
 def _message_to_vacancy(channel: str, entity: object, message: Message) -> Vacancy | None:
-    text = clean_text_for_display(message.message or "")
+    text = preserve_original_text(message.message or "")
     if not text:
         return None
 
@@ -61,10 +62,14 @@ def _message_to_vacancy(channel: str, entity: object, message: Message) -> Vacan
     message_id = int(message.id)
     link = _post_link(channel, entity, message_id)
     published_at = message.date.isoformat(timespec="seconds") if message.date else ""
+    username = getattr(entity, "username", None)
+    chat_id = getattr(entity, "id", None)
+    chat_identifier = str(chat_id or username or source or channel)
     if message_id:
-        content_hash_exact = sha256_text(f"telegram|{source}|{message_id}")
+        source_key = f"telegram|{chat_identifier}|{message_id}"
     else:
-        content_hash_exact = sha256_text(f"telegram|{source}|{normalize_for_hash(text)}")
+        source_key = f"telegram|{chat_identifier}|{normalize_for_hash(text)}"
+    content_hash_exact = sha256_text(source_key)
     normalized_text = normalize_text_for_hashing(text)
     content_hash_normalized = normalized_content_hash(text)
 
@@ -79,22 +84,51 @@ def _message_to_vacancy(channel: str, entity: object, message: Message) -> Vacan
         content_hash_exact=content_hash_exact,
         content_hash_normalized=content_hash_normalized,
         content_normalized=normalized_text,
-        metadata={"message_id": message_id},
+        metadata={
+            "source_key": source_key,
+            "dedupe_key": source_key,
+            "source_channel": source,
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "username": username,
+        },
     )
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def fetch_telegram_vacancies(
     client: object,
     channels: list[str],
-    posts_per_channel: int,
+    days_back: int = 3,
+    max_messages_per_channel: int = 0,
 ) -> SourceResult:
     result = SourceResult()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days_back))
 
     for channel in channels:
         try:
             logger.info("Reading Telegram channel: %s", channel)
             entity = await client.get_entity(channel)
-            async for message in client.iter_messages(entity, limit=posts_per_channel):
+            scanned_for_channel = 0
+            async for message in client.iter_messages(entity, limit=None):
+                message_date = _as_utc(getattr(message, "date", None))
+                if message_date and message_date < cutoff:
+                    break
+                scanned_for_channel += 1
+                if max_messages_per_channel > 0 and scanned_for_channel > max_messages_per_channel:
+                    logger.warning(
+                        "Telegram scan limit reached for %s: %s messages",
+                        channel,
+                        max_messages_per_channel,
+                    )
+                    break
                 result.checked += 1
                 vacancy = _message_to_vacancy(channel, entity, message)
                 if vacancy:

@@ -3,6 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .extraction import (
+    detect_role_from_text,
+    has_age_18_restriction,
+    has_female_only_requirement,
+    has_required_experience,
+    matched_role_keywords,
+    vacancy_filter_text,
+)
 from .utils import Vacancy, as_int
 
 
@@ -15,8 +23,6 @@ DEFAULT_FEMALE_TERMS = (
     "дівчат",
     "женщина",
     "жінка",
-    "заготовщица",
-    "кухарка",
 )
 
 DEFAULT_FEMALE_JOB_TERMS = (
@@ -25,8 +31,6 @@ DEFAULT_FEMALE_JOB_TERMS = (
     "офіціант",
     "офіціантка",
     "хостес",
-    "бармен",
-    "бариста",
 )
 
 DEFAULT_MALE_OR_NEUTRAL_TERMS = (
@@ -132,7 +136,6 @@ def _has_any(text: str, phrases: list[str] | tuple[str, ...]) -> bool:
 def _detect_hard_reject(text: str, filters: dict[str, Any]) -> str:
     hard_keywords = [str(item) for item in filters.get("hard_reject_keywords", [])]
     scam_patterns = [str(item) for item in filters.get("scam_reject_patterns", [])]
-    female_patterns = [str(item) for item in filters.get("female_only_reject_patterns", [])]
 
     matches = _find_matches(text, hard_keywords)
     if matches:
@@ -142,22 +145,11 @@ def _detect_hard_reject(text: str, filters: dict[str, Any]) -> str:
     if matches:
         return f"scam pattern: {matches[0]}"
 
-    matches = _find_matches(text, female_patterns)
-    if matches:
-        return f"female-only pattern: {matches[0]}"
+    if has_age_18_restriction(text):
+        return "age restriction 18+"
 
-    female_terms = _find_matches(text, DEFAULT_FEMALE_TERMS)
-    has_male_or_neutral_terms = _has_any(text, DEFAULT_MALE_OR_NEUTRAL_TERMS)
-    if (
-        female_terms
-        and not has_male_or_neutral_terms
-        and _has_any(text, DEFAULT_FEMALE_JOB_TERMS)
-        and _has_any(text, HIRING_WORDS)
-    ):
-        return f"female-only wording: {female_terms[0]}"
-
-    if female_terms and not has_male_or_neutral_terms and _has_any(text, AGE_LIMIT_TERMS):
-        return "female-only age limit"
+    if has_female_only_requirement(text):
+        return "female-only requirement"
 
     if _has_any(text, ("массаж", "massage")) and _has_any(text, SUSPICIOUS_MASSAGE_CONTEXT):
         return "suspicious massage/adult wording"
@@ -172,43 +164,40 @@ def detect_vacancy_type(matches: list[str]) -> str:
     if not matches:
         return "other"
 
-    normalized = [_normalize(match) for match in matches]
-    groups = (
-        ("waiter", ("waiter", "официант", "официантка", "офiцiант", "офiцiантка")),
-        ("runner", ("runner", "раннер", "ранер")),
-        ("hostess", ("hostess", "хостес")),
-        ("bartender", ("bartender", "бармен")),
-        ("barista", ("barista", "бариста")),
-        ("kitchen helper", ("помощник кухни", "помічник кухаря", "кухня")),
-        ("restaurant staff", ("restaurant staff", "персонал ресторана", "персонал кафе")),
-    )
-    for label, terms in groups:
-        if any(any(term in match for term in terms) for match in normalized):
-            return label
-    return matches[0]
+    return detect_role_from_text("\n".join(matches)) or matches[0]
 
 
 def score_vacancy(vacancy: Vacancy, config: dict[str, Any]) -> FilterResult:
     filters = config.get("filters", {})
     min_score = as_int(config.get("min_score", filters.get("min_score", 5)), 5)
 
-    core_keywords = [str(item) for item in filters.get("core_keywords", [])]
     context_keywords = [str(item) for item in filters.get("restaurant_context_keywords", [])]
     bonus_keywords = [str(item) for item in filters.get("bonus_keywords", [])]
     locations = [str(item) for item in filters.get("locations", [])]
 
-    text = "\n".join([vacancy.title or "", vacancy.text or "", vacancy.source or ""])
+    text = "\n".join([vacancy.title or "", vacancy_filter_text(vacancy)])
+    matched_core = matched_role_keywords(text)
+    if not matched_core:
+        return FilterResult(accepted=False, reject_reason="no allowed target role keyword")
+
     reject_reason = _detect_hard_reject(text, filters)
     if reject_reason:
         return FilterResult(
             accepted=False,
             hard_rejected=True,
             reject_reason=reject_reason,
+            matched_core_keywords=matched_core,
+            vacancy_type=detect_vacancy_type(matched_core),
         )
 
-    matched_core = _find_matches(text, core_keywords)
-    if not matched_core:
-        return FilterResult(accepted=False, reject_reason="no core restaurant/cafe keyword")
+    if has_required_experience(text):
+        return FilterResult(
+            accepted=False,
+            hard_rejected=True,
+            reject_reason="target role requires experience",
+            matched_core_keywords=matched_core,
+            vacancy_type=detect_vacancy_type(matched_core),
+        )
 
     matched_context = _find_matches(text, context_keywords)
     matched_bonus = _find_matches(text, bonus_keywords)

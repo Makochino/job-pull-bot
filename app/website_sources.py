@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,6 +44,19 @@ def load_sites(path: Path) -> list[dict[str, Any]]:
         if not isinstance(site, dict) or not (site.get("url") or site.get("urls") or site.get("pages")):
             logger.warning("Skipping invalid site config: %s", site)
             continue
+        if site.get("enabled") is False or site.get("active") is False:
+            logger.info("Skipping disabled website source: %s", site.get("name") or site.get("url"))
+            continue
+        site_identity = " ".join(
+            [
+                str(site.get("name") or ""),
+                str(site.get("base_url") or ""),
+                " ".join(_site_urls(site)),
+            ]
+        ).casefold()
+        if "robota.ua" in site_identity:
+            logger.info("Skipping Robota.ua source because it is disabled by default: %s", site.get("name") or site.get("url"))
+            continue
         valid_sites.append(site)
     return valid_sites
 
@@ -58,6 +72,14 @@ def _as_list(value: Any) -> list[Any]:
 def _site_urls(site: dict[str, Any]) -> list[str]:
     raw_urls = _as_list(site.get("urls")) or _as_list(site.get("pages")) or _as_list(site.get("url"))
     return [str(url).strip() for url in raw_urls if str(url).strip()]
+
+
+def _canonical_url(url: str) -> str:
+    if not url:
+        return ""
+    parts = urlsplit(url.strip())
+    path = parts.path.rstrip("/") or parts.path
+    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), path, "", ""))
 
 
 def _select_text(card: Any, selector: str | list[str] | None) -> str:
@@ -93,11 +115,20 @@ def _build_headers(
     user_agent: str,
     default_headers: dict[str, Any] | None,
     site_headers: dict[str, Any] | None,
+    referer_url: str = "",
 ) -> dict[str, str]:
     headers: dict[str, str] = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,uk-UA;q=0.8,uk;q=0.7,en;q=0.6",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Referer": referer_url or "https://www.google.com/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
     }
     for source in (default_headers or {}, site_headers or {}):
         for key, value in source.items():
@@ -107,16 +138,66 @@ def _build_headers(
 
 def _zero_cards_reason(response: requests.Response, html: str) -> str:
     status_code = response.status_code
-    if status_code in {401, 403, 429}:
-        return f"site may be blocking requests (HTTP {status_code})"
+    if status_code == 403:
+        return "blocked_by_site_403"
+    if status_code in {401, 429}:
+        return f"blocked_by_site_http_{status_code}"
     if len(html) < 8000:
-        return "short HTML response; possible dynamic page, bot protection, or selector mismatch"
+        return "dynamic_or_bot_protected_short_html"
     lowered = html.casefold()
     if "captcha" in lowered or "cloudflare" in lowered:
-        return "possible bot protection/captcha"
+        return "dynamic_or_bot_protected_captcha"
     if "__next_data__" in lowered or "ng-version" in lowered or "window.__" in lowered:
-        return "possible dynamic page rendered by JavaScript"
-    return "possible dynamic page or selector mismatch"
+        return "dynamic_or_bot_protected"
+    return "dynamic_or_selector_mismatch"
+
+
+def _iter_json_values(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        found.append(value)
+        for child in value.values():
+            found.extend(_iter_json_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_iter_json_values(child))
+    return found
+
+
+def _json_ld_job_postings(soup: BeautifulSoup, base_url: str, page_url: str) -> list[dict[str, str]]:
+    jobs: list[dict[str, str]] = []
+    for script in soup.select("script[type='application/ld+json']"):
+        raw = script.string or script.get_text("", strip=True)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for item in _iter_json_values(data):
+            raw_type = item.get("@type")
+            types = raw_type if isinstance(raw_type, list) else [raw_type]
+            if not any(str(value).casefold() == "jobposting" for value in types):
+                continue
+            title = clean_text(str(item.get("title") or ""))
+            description_html = str(item.get("description") or "")
+            description = clean_vacancy_text(BeautifulSoup(description_html, "html.parser").get_text("\n", strip=True))
+            url = item.get("url") or item.get("sameAs") or ""
+            link = urljoin(base_url or page_url, str(url)) if url else page_url
+            hiring = item.get("hiringOrganization") if isinstance(item.get("hiringOrganization"), dict) else {}
+            organization = clean_text(str(hiring.get("name") or ""))
+            location = item.get("jobLocation")
+            location_text = ""
+            if isinstance(location, dict):
+                address = location.get("address")
+                if isinstance(address, dict):
+                    location_text = clean_text(" ".join(str(value) for value in address.values() if value))
+                else:
+                    location_text = clean_text(str(address or ""))
+            text = clean_vacancy_text("\n".join(part for part in (title, organization, description, location_text) if part))
+            if title or text:
+                jobs.append({"title": title or first_line_title(text, fallback="Website vacancy"), "text": text, "link": link})
+    return jobs
 
 
 def _page_sample(soup: BeautifulSoup, html: str) -> str:
@@ -158,6 +239,10 @@ def _fetch_detail_text(
         "detail_content_length": 0,
         "detail_error": "",
     }
+    if "robota.ua" in link.casefold():
+        detail["detail_error"] = "disabled_source"
+        logger.info("Skipping disabled Robota.ua detail URL: %s", link)
+        return "", detail
     try:
         response = session.get(link, headers=headers, timeout=timeout)
         detail["detail_final_url"] = response.url
@@ -171,10 +256,12 @@ def _fetch_detail_text(
             response.url,
             len(response.text),
         )
+        if response.status_code == 403:
+            detail["detail_error"] = "blocked_by_site_403"
+            logger.warning("Website detail blocked by site: name=%s url=%s status=403", name, link)
+            return "", detail
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        if "robota.ua" in link:
-            logger.info("Robota.ua detail sample: %s", _page_sample(soup, response.text))
         return _detail_text(soup), detail
     except requests.RequestException as exc:
         detail["detail_error"] = str(exc)
@@ -200,8 +287,13 @@ def fetch_website_vacancies(
     for site in sites:
         name = str(site.get("name") or site.get("url") or "Website")
         base_url = str(site.get("base_url") or site.get("url") or "")
+        site_identity = " ".join([name, base_url, " ".join(_site_urls(site))]).casefold()
+        if "robota.ua" in site_identity:
+            logger.info("Skipping Robota.ua source because it is disabled by default: %s", name)
+            continue
         vacancy_selectors = [str(item) for item in _as_list(site.get("vacancy_selector")) if str(item).strip()]
-        headers = _build_headers(user_agent, default_headers, site.get("headers") or {})
+        headers = _build_headers(user_agent, default_headers, site.get("headers") or {}, base_url)
+        session.headers.update(headers)
 
         if not vacancy_selectors:
             result.errors += 1
@@ -240,11 +332,24 @@ def fetch_website_vacancies(
                     response.url,
                     len(response.text),
                 )
+                if response.status_code in {401, 403, 429}:
+                    result.errors += 1
+                    reason = _zero_cards_reason(response, response.text)
+                    page_summary["possible_dynamic"] = True
+                    page_summary["zero_reason"] = reason
+                    result.debug_summaries.append(f"{name}: {reason} at {url} (HTTP {response.status_code}).")
+                    logger.warning(
+                        "Website blocked: name=%s url=%s status=%s reason=%s",
+                        name,
+                        url,
+                        response.status_code,
+                        reason,
+                    )
+                    continue
+
                 response.raise_for_status()
 
                 soup = BeautifulSoup(response.text, "html.parser")
-                if "robota.ua" in url:
-                    logger.info("Robota.ua page sample: %s", _page_sample(soup, response.text))
                 cards: list[Any] = []
                 used_selector = ""
                 for vacancy_selector in vacancy_selectors:
@@ -253,6 +358,10 @@ def fetch_website_vacancies(
                         used_selector = vacancy_selector
                         break
                 cards_found = len(cards)
+                embedded_jobs = _json_ld_job_postings(soup, base_url, url) if not cards else []
+                if embedded_jobs:
+                    used_selector = "embedded JSON-LD JobPosting"
+                    cards_found = len(embedded_jobs)
                 page_summary["cards_found"] = cards_found
                 result.cards_found += cards_found
                 logger.info(
@@ -262,6 +371,54 @@ def fetch_website_vacancies(
                     used_selector or ",".join(vacancy_selectors),
                     cards_found,
                 )
+
+                if not cards and embedded_jobs:
+                    parsed_count = 0
+                    parsed_links: list[str] = []
+                    for job in embedded_jobs:
+                        title = job["title"]
+                        full_text = job["text"]
+                        link = job["link"]
+                        canonical_link = _canonical_url(link)
+                        hash_base = (
+                            f"website|{canonical_link}"
+                            if canonical_link
+                            else f"website|{name}|{normalize_for_hash(title)}|{normalize_for_hash(full_text)}"
+                        )
+                        exact_hash = sha256_text(hash_base)
+                        normalized_text = normalize_vacancy_content("\n".join([title, full_text]))
+                        normalized_hash = normalized_content_hash(normalized_text)
+                        result.vacancies.append(
+                            Vacancy(
+                                source=name,
+                                source_type=str(site.get("source_type") or "website"),
+                                title=title,
+                                text=full_text,
+                                link=link,
+                                published_at=now_iso(),
+                                content_hash=exact_hash,
+                                content_hash_exact=exact_hash,
+                                content_hash_normalized=normalized_hash,
+                                content_normalized=normalized_text,
+                                metadata={
+                                    "source_key": hash_base,
+                                    "canonical_url": canonical_link,
+                                    "site_name": name,
+                                    "page_url": url,
+                                    "parsed_from": "json_ld",
+                                },
+                            )
+                        )
+                        if link:
+                            parsed_links.append(link)
+                        parsed_count += 1
+                    page_summary["parsed"] = parsed_count
+                    page_summary["parsed_links"] = parsed_links[:10]
+                    page_summary["details_fetched"] = 0
+                    page_summary["details_skipped_by_limit"] = 0
+                    result.parsed += parsed_count
+                    logger.info("Website JSON-LD parsed: name=%s url=%s parsed=%s", name, url, parsed_count)
+                    continue
 
                 if not cards:
                     page_summary["possible_dynamic"] = True
@@ -318,9 +475,10 @@ def fetch_website_vacancies(
                     elif link:
                         page_detail_skipped += 1
 
+                    canonical_link = _canonical_url(link)
                     hash_base = (
-                        f"website|{name}|{link}"
-                        if link
+                        f"website|{canonical_link}"
+                        if canonical_link
                         else f"website|{name}|{normalize_for_hash(title)}|{normalize_for_hash(full_text)}"
                     )
                     exact_hash = sha256_text(hash_base)
@@ -340,6 +498,8 @@ def fetch_website_vacancies(
                             content_hash_normalized=normalized_hash,
                             content_normalized=normalized_text,
                             metadata={
+                                "source_key": hash_base,
+                                "canonical_url": canonical_link,
                                 "site_name": name,
                                 "page_url": url,
                                 **detail_data,

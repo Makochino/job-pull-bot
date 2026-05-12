@@ -154,9 +154,14 @@ def load_app_config(path: Path) -> dict[str, Any]:
     data.setdefault("notify_user_on_startup", True)
     data.setdefault("telegram_resend_latest_on_pull", False)
     data.setdefault("telegram_latest_limit", 10)
-    data.setdefault("telegram_posts_per_channel", 30)
+    data.setdefault("telegram_scan_days", 3)
+    data.setdefault("telegram_scan_max_messages_per_channel", 0)
     data.setdefault("website_request_timeout", 15)
-    data.setdefault("website_user_agent", "Mozilla/5.0 TelegramJobPullBot/1.0")
+    data.setdefault(
+        "website_user_agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    )
     data.setdefault("website_headers", {})
     data.setdefault("website_detail_pages_limit", data.get("max_results_per_pull", 20))
     data.setdefault("website_detail_delay_seconds", 0.7)
@@ -222,6 +227,12 @@ def clean_vacancy_text(value: str | None) -> str:
         cleaned_lines.append(line)
         previous = line
     return "\n".join(cleaned_lines)
+
+
+def preserve_original_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").strip("\n")
 
 
 def clean_text_for_display(value: str | None) -> str:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 from datetime import datetime
 from typing import Any
 
-from . import extraction
+from .extraction import OTHER_ROLE_TERMS, ROLE_GROUPS, normalize_match_text
 from .utils import Vacancy, clean_text_for_display, clean_vacancy_text, truncate_text
 
 
@@ -28,6 +29,102 @@ def _format_date(value: str | None) -> str:
 
 def _clip_message(value: str) -> str:
     return truncate_text(value, TELEGRAM_MESSAGE_LIMIT)
+
+
+def _display_original_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").strip("\n")
+
+
+def _split_long_raw_line(line: str, max_escaped_len: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for char in line:
+        if current and len(_html(current + char)) > max_escaped_len:
+            chunks.append(current)
+            current = char
+        else:
+            current += char
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_raw_text_for_html(value: str, max_escaped_len: int) -> list[str]:
+    if not value:
+        return [""]
+
+    chunks: list[str] = []
+    current = ""
+    for line in value.splitlines(keepends=True):
+        pieces = (
+            _split_long_raw_line(line, max_escaped_len)
+            if len(_html(line)) > max_escaped_len
+            else [line]
+        )
+        for piece in pieces:
+            if current and len(_html(current + piece)) > max_escaped_len:
+                chunks.append(current.rstrip("\n"))
+                current = piece
+            else:
+                current += piece
+    if current or not chunks:
+        chunks.append(current.rstrip("\n"))
+    return chunks
+
+
+def _format_text_messages(header: str, text: str | None, link: str | None) -> list[str]:
+    display_text = _display_original_text(text)
+    display_link = link or "not available"
+    body_chunks = _split_raw_text_for_html(display_text, TELEGRAM_MESSAGE_LIMIT - 600)
+
+    messages: list[str] = []
+    last_index = len(body_chunks) - 1
+    for index, chunk in enumerate(body_chunks):
+        parts: list[str] = []
+        if index == 0:
+            parts.append(header)
+            parts.append("")
+            parts.append("Text:")
+        if chunk:
+            if parts:
+                if index == 0:
+                    parts[-1] = f"{parts[-1]}\n{_html(chunk)}"
+                else:
+                    parts.append(_html(chunk))
+            else:
+                parts.append(_html(chunk))
+        if index == last_index:
+            if parts:
+                parts.append("")
+            parts.append(f"Link:\n{_html(display_link)}")
+
+        message = "\n".join(parts)
+        if len(message) <= TELEGRAM_MESSAGE_LIMIT:
+            messages.append(message)
+            continue
+
+        overflow_chunks = _split_raw_text_for_html(chunk, TELEGRAM_MESSAGE_LIMIT - 1000)
+        for overflow_index, overflow_chunk in enumerate(overflow_chunks):
+            overflow_parts: list[str] = []
+            if index == 0 and overflow_index == 0:
+                overflow_parts.append(header)
+                overflow_parts.append("")
+                overflow_parts.append(f"Text:\n{_html(overflow_chunk)}")
+            else:
+                overflow_parts.append(_html(overflow_chunk))
+            if index == last_index and overflow_index == len(overflow_chunks) - 1:
+                overflow_parts.append("")
+                overflow_parts.append(f"Link:\n{_html(display_link)}")
+            messages.append("\n".join(overflow_parts))
+    return messages
+
+
+def _truncate_display_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _clean_field(value: str | None, limit: int = 220) -> str:
@@ -110,106 +207,18 @@ def format_vacancy(vacancy: Vacancy) -> str:
 
 
 def format_telegram_vacancy(vacancy: Vacancy) -> str:
-    text = truncate_text(clean_text_for_display(vacancy.text), 1900)
-    link = vacancy.link or "not available"
-    role = vacancy.role or vacancy.vacancy_type or extraction.detect_role_from_text(vacancy.text)
-    salary = vacancy.salary if _known(vacancy.salary) else extraction.extract_salary(vacancy.text)
-    schedule = vacancy.schedule if _known(vacancy.schedule) else extraction.extract_schedule(vacancy.text)
-    location = vacancy.location if _known(vacancy.location) else extraction.extract_location(vacancy.text)
-    contact = vacancy.contact if _known(vacancy.contact) else extraction.extract_contact(vacancy.text)
-    age = vacancy.age_requirement if _known(vacancy.age_requirement) else extraction.extract_age_requirement(vacancy.text)
-    experience = (
-        vacancy.experience_requirement
-        if _known(vacancy.experience_requirement)
-        else extraction.extract_experience_requirement(vacancy.text)
-    )
-    gender = (
-        vacancy.gender_requirement
-        if _known(vacancy.gender_requirement)
-        else extraction.extract_gender_requirement(vacancy.text)
-    )
-    message = f"""⭐ <b>Relevance:</b> {vacancy.score}/10
-
-💼 <b>Role:</b> {_html(extraction.role_display(role))}
-💰 <b>Salary:</b> {_html(salary)}
-🕒 <b>Schedule:</b> {_html(schedule)}
-📍 <b>Location:</b> {_html(location)}
-🎂 <b>Age:</b> {_html(age)}
-🧰 <b>Experience:</b> {_html(experience)}
-⚧ <b>Gender:</b> {_html(gender)}
-☎️ <b>Contact:</b> {_html(contact)}
-
-<b>Text:</b>
-{_html(text)}
-
-<b>Link:</b>
-{_html(link)}"""
-    return _clip_message(message)
+    return _format_text_card("🧾 <b>Vacancy</b>", vacancy.text, vacancy.link)
 
 
 def format_website_vacancy(vacancy: Vacancy) -> str:
-    title = _clean_field(vacancy.title or "Untitled", 220)
-    text = clean_vacancy_text(vacancy.text)
-    role_text = "\n".join([vacancy.title or "", text])
-    role = vacancy.role or vacancy.vacancy_type or extraction.detect_role_from_text(role_text)
-    salary = vacancy.salary if _known(vacancy.salary) else extraction.extract_salary(text)
-    schedule = vacancy.schedule if _known(vacancy.schedule) else extraction.extract_schedule(text)
-    workplace = vacancy.location if _known(vacancy.location) else extraction.extract_location(role_text)
-    phone = vacancy.contact if _known(vacancy.contact) else extraction.extract_contact(text)
-    age = vacancy.age_requirement if _known(vacancy.age_requirement) else extraction.extract_age_requirement(text)
-    experience = (
-        vacancy.experience_requirement
-        if _known(vacancy.experience_requirement)
-        else extraction.extract_experience_requirement(text)
-    )
-    gender = (
-        vacancy.gender_requirement
-        if _known(vacancy.gender_requirement)
-        else extraction.extract_gender_requirement(text)
-    )
-    link = vacancy.link or "not available"
-
-    message = f"""🌐 <b>Website vacancy</b>
-
-⭐ <b>Relevance:</b> {vacancy.score}/10
-
-💼 <b>Role:</b>
-{_html(extraction.role_display(role))}
-
-💼 <b>Title:</b>
-{_html(title)}
-
-💰 <b>Salary:</b>
-{_html(salary)}
-
-🕒 <b>Schedule:</b>
-{_html(schedule)}
-
-📍 <b>Workplace:</b>
-{_html(workplace)}
-
-🎂 <b>Age:</b>
-{_html(age)}
-
-🧰 <b>Experience:</b>
-{_html(experience)}
-
-⚧ <b>Gender:</b>
-{_html(gender)}
-
-☎️ <b>Phone:</b>
-{_html(phone)}
-
-🔗 <b>Link:</b>
-{_html(link)}"""
-    return _clip_message(message)
+    return _format_text_card("🧾 <b>Vacancy</b>", vacancy.text, vacancy.link)
 
 
 def format_latest(rows: list[Any]) -> str:
     if not rows:
         return (
             "😕 <b>No saved matching vacancies yet.</b>\n\n"
-            "Use the buttons below or /pull_tg and /pull_sites to search."
+            "Use the buttons below or /pull_tg to search Telegram channels."
         )
 
     lines = ["📌 <b>Latest saved vacancies</b>"]
@@ -232,97 +241,133 @@ def format_latest(rows: list[Any]) -> str:
     return _clip_message("\n".join(lines))
 
 
-def _format_db_vacancy_card(row: Any, header: str, text_limit: int = 900) -> str:
-    raw_title = str(_row_get(row, "title", "Untitled"))
-    raw_text = str(_row_get(row, "text", ""))
-    role_text = "\n".join([raw_title, raw_text])
-    role = str(
-        _row_get(row, "extracted_role", "")
-        or _row_get(row, "vacancy_type", "")
-        or extraction.detect_role_from_text(role_text)
-        or "other"
-    )
-    title = _clean_field(raw_title, 160)
-    salary_value = str(_row_get(row, "extracted_salary", ""))
-    schedule_value = str(_row_get(row, "extracted_schedule", ""))
-    location_value = str(_row_get(row, "extracted_location", ""))
-    contact_value = str(_row_get(row, "extracted_contact", ""))
-    age_value = str(_row_get(row, "extracted_age_requirement", ""))
-    experience_value = str(_row_get(row, "extracted_experience_requirement", ""))
-    gender_value = str(_row_get(row, "extracted_gender_requirement", ""))
-    salary = _clean_field(salary_value if _known(salary_value) else extraction.extract_salary(raw_text), 180)
-    schedule = _clean_field(schedule_value if _known(schedule_value) else extraction.extract_schedule(raw_text), 180)
-    location = _clean_field(location_value if _known(location_value) else extraction.extract_location(role_text), 180)
-    contact = _clean_field(contact_value if _known(contact_value) else extraction.extract_contact(raw_text), 160)
-    age = _clean_field(age_value if _known(age_value) else extraction.extract_age_requirement(raw_text), 160)
-    experience = _clean_field(
-        experience_value if _known(experience_value) else extraction.extract_experience_requirement(raw_text),
-        180,
-    )
-    gender = _clean_field(gender_value if _known(gender_value) else extraction.extract_gender_requirement(raw_text), 160)
-    text = truncate_text(clean_text_for_display(raw_text), text_limit)
-    link = str(_row_get(row, "link", "") or "not available")
-    source = str(_row_get(row, "source", "not specified"))
-    score = int(_row_get(row, "score", 0) or 0)
-
+def _format_text_card(header: str, text: str, link: str | None, text_limit: int | None = None) -> str:
+    display_link = link or "not available"
+    if text_limit is None:
+        text_limit = max(200, TELEGRAM_MESSAGE_LIMIT - len(header) - len(display_link) - 40)
+    display_text = _truncate_display_text(_display_original_text(text), text_limit)
     return _clip_message(
         f"{header}\n\n"
-        f"⭐ <b>Relevance:</b> {score}/10\n"
-        f"💼 <b>Role:</b> {_html(extraction.role_display(role))}\n"
-        f"💼 <b>Title:</b> {_html(title)}\n"
-        f"💰 <b>Salary:</b> {_html(salary)}\n"
-        f"🕒 <b>Schedule:</b> {_html(schedule)}\n"
-        f"📍 <b>Location:</b> {_html(location)}\n"
-        f"🎂 <b>Age:</b> {_html(age)}\n"
-        f"🧰 <b>Experience:</b> {_html(experience)}\n"
-        f"⚧ <b>Gender:</b> {_html(gender)}\n"
-        f"☎️ <b>Contact:</b> {_html(contact)}\n"
-        f"📣 <b>Source:</b> {_html(source)}\n\n"
-        f"<b>Text:</b>\n{_html(text)}\n\n"
-        f"🔗 <b>Link:</b>\n{_html(link)}"
+        f"{_html(display_text)}\n\n"
+        f"<b>Link:</b>\n{_html(display_link)}"
     )
+
+
+def _format_db_vacancy_card(row: Any, header: str, text_limit: int | None = None) -> str:
+    raw_text = str(_row_get(row, "text", ""))
+    link = str(_row_get(row, "link", "") or "not available")
+    return _format_text_card(header, raw_text, link, text_limit=text_limit)
 
 
 def format_review_vacancy(row: Any, left_count: int) -> str:
-    header = f"🧾 <b>Vacancy review</b>\nVacancies left: <b>{left_count}</b>"
-    return _format_db_vacancy_card(row, header=header, text_limit=1200)
+    return format_review_vacancy_messages(row, left_count)[0]
+
+
+def format_review_vacancy_messages(row: Any, left_count: int) -> list[str]:
+    header = f"🧾 Vacancy review\nVacancies left: {left_count}"
+    raw_text = str(_row_get(row, "text", ""))
+    link = str(_row_get(row, "link", "") or "not available")
+    return _format_text_messages(header, raw_text, link)
+
+
+def format_saved_vacancy_messages(row: Any, number: int) -> list[str]:
+    header = f"❤️ <b>Saved vacancy #{number}</b>"
+    raw_text = str(_row_get(row, "text", ""))
+    link = str(_row_get(row, "link", "") or "not available")
+    return _format_text_messages(header, raw_text, link)
+
+
+def _strip_place_name(value: str) -> str:
+    value = re.sub(r"\s+", " ", value.strip(" «»\"'“”„:,-"))
+    value = re.split(
+        r"\s+\b(?:требуется|требуются|потрібн[аіi]?|потрiбн[аіi]?|шукаємо|ищем|набираем|у|в|на)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE | re.UNICODE,
+    )[0]
+    return truncate_text(value.strip(" «»\"'“”„:,-"), 60)
+
+
+def detect_establishment_name(text: str | None) -> str:
+    raw_text = _display_original_text(text)
+    if not raw_text:
+        return ""
+
+    patterns = (
+        r"\b(?:ресторан|кафе|бар|готель|отель|restaurant|cafe|hotel)\s+[«\"“„']([^»\"“”']{2,80})[»\"“”']",
+        r"\b(?:в|у)\s+(?:ресторан|кафе|бар|готель|отель|restaurant|cafe|hotel)\s+([A-ZА-ЯІЇЄҐ][^\n,.;:]{1,80})",
+        r"\b(?:ресторан|кафе|бар|готель|отель|restaurant|cafe|hotel)\s+([A-ZА-ЯІЇЄҐ][^\n,.;:]{1,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE | re.UNICODE)
+        if match:
+            name = _strip_place_name(match.group(1))
+            if name:
+                return name
+
+    role_terms = tuple(term for group in ROLE_GROUPS for term in group.terms) + OTHER_ROLE_TERMS
+    blocked_terms = (
+        "требуется",
+        "требуются",
+        "потріб",
+        "потрiб",
+        "ищем",
+        "шукаємо",
+        "зарплата",
+        "з/п",
+        "ставка",
+        "график",
+        "графік",
+        "тел",
+        "адрес",
+        "вакан",
+    )
+    for raw_line in raw_text.splitlines()[:6]:
+        line = _strip_place_name(re.sub(r"^[^\wА-Яа-яІіЇїЄєҐґ]+", "", raw_line))
+        if not (2 <= len(line) <= 60):
+            continue
+        normalized = normalize_match_text(line)
+        if any(term in normalized for term in blocked_terms):
+            continue
+        if any(normalize_match_text(term) in normalized for term in role_terms):
+            continue
+        if re.search(r"[A-ZА-ЯІЇЄҐ]", line) or "." in line:
+            return line
+    return ""
+
+
+def format_saved_vacancies_page(rows: list[Any], page: int, page_size: int = 5) -> str:
+    if not rows:
+        return (
+            "❤️ <b>No saved vacancies yet.</b>\n\n"
+            "Like vacancies during review and they will appear here."
+        )
+
+    total = len(rows)
+    page_size = max(1, page_size)
+    page_count = max(1, math.ceil(total / page_size))
+    page = min(max(0, page), page_count - 1)
+    start = page * page_size
+    end = min(total, start + page_size)
+
+    lines = ["❤️ <b>Saved vacancies</b>"]
+    if page_count > 1:
+        lines.append(f"Page <b>{page + 1}</b>/<b>{page_count}</b>")
+
+    for index, row in enumerate(rows[start:end], start=start + 1):
+        name = detect_establishment_name(str(_row_get(row, "text", ""))) or "No info"
+        link = str(_row_get(row, "link", "") or "not available")
+        lines.append(f"\n#{index} — {_html(name)}\n{_html(link)}")
+    return _clip_message("\n".join(lines))
 
 
 def format_saved_vacancies(rows: list[Any]) -> list[str]:
-    if not rows:
-        return [
-            "❤️ <b>No saved vacancies yet.</b>\n\n"
-            "Like vacancies during review and they will appear here."
-        ]
-
-    total = len(rows)
-    cards = [
-        _format_db_vacancy_card(
-            row,
-            header=f"❤️ <b>Saved vacancy #{index} of {total}</b>",
-            text_limit=650,
-        )
-        for index, row in enumerate(rows, start=1)
-    ]
-
-    chunks: list[str] = []
-    current = "❤️ <b>Saved vacancies</b>"
-    for card in cards:
-        candidate = f"{current}\n\n{card}" if current else card
-        if len(candidate) > TELEGRAM_MESSAGE_LIMIT - 100:
-            chunks.append(_clip_message(current))
-            current = card
-        else:
-            current = candidate
-    if current:
-        chunks.append(_clip_message(current))
-    return chunks
+    return [format_saved_vacancies_page(rows, page=0)]
 
 
 def format_deleted_saved_vacancy(row: Any, number: int) -> str:
     title = _clean_field(str(_row_get(row, "title", "Untitled")), 120)
-    role = extraction.role_display(str(_row_get(row, "extracted_role", "") or "other"))
-    return f"🗑 Deleted saved vacancy #{number}: <b>{_html(role)}</b> - {_html(title)}"
+    return f"🗑 Deleted saved vacancy #{number}: <b>{_html(title)}</b>"
 
 
 def format_no_pending_review() -> str:
@@ -335,7 +380,7 @@ def format_rejected_vacancies(rows: list[Any]) -> str:
 
     lines = ["🧾 <b>Recently rejected vacancies</b>"]
     for index, row in enumerate(rows, start=1):
-        role = extraction.role_display(str(_row_get(row, "extracted_role", "") or "other"))
+        role = str(_row_get(row, "extracted_role", "") or "other")
         reason = _clean_field(str(_row_get(row, "reject_reason", "")), 180)
         text = truncate_text(clean_text_for_display(str(_row_get(row, "text", ""))), 420)
         score = int(_row_get(row, "score", 0) or 0)
@@ -359,7 +404,6 @@ def format_stats(stats: dict[str, Any]) -> str:
     return (
         "📊 <b>Stats</b>\n\n"
         f"Telegram vacancies saved: <b>{stats.get('telegram_saved', 0)}</b>\n"
-        f"Website vacancies saved: <b>{stats.get('website_saved', 0)}</b>\n"
         f"Total saved: <b>{stats.get('total_saved', 0)}</b>\n"
         f"Pending review: <b>{stats.get('pending_review', 0)}</b>\n"
         f"Liked / saved: <b>{stats.get('liked_saved', 0)}</b>\n"
@@ -372,7 +416,6 @@ def format_stats(stats: dict[str, Any]) -> str:
         f"Cross-channel duplicates: <b>{stats.get('cross_channel_duplicates_total', 0)}</b>\n"
         f"Already sent: <b>{stats.get('already_sent_total', 0)}</b>\n"
         f"Telegram pulls: <b>{stats.get('pull_tg_total', 0)}</b>\n"
-        f"Website pulls: <b>{stats.get('pull_sites_total', 0)}</b>\n"
         f"Hard rejected: <b>{stats.get('hard_rejected_total', 0)}</b>"
     )
 
@@ -394,14 +437,11 @@ def format_settings(config: dict[str, Any]) -> str:
         "⚙️ <b>Current settings</b>\n\n"
         f"Profile: <b>{_html(str(config.get('profile_name', 'restaurant/cafe jobs in Odesa')))}</b>\n"
         f"min_score: <b>{config.get('min_score', 5)}</b>\n"
-        f"max_results_per_pull: <b>{config.get('max_results_per_pull', 20)}</b>\n"
-        f"batch_size: <b>{config.get('batch_size', 5)}</b>\n"
-        f"telegram_resend_latest_on_pull: <b>{config.get('telegram_resend_latest_on_pull', False)}</b>\n"
-        f"telegram_latest_limit: <b>{config.get('telegram_latest_limit', 10)}</b>\n"
+        f"telegram_scan_days: <b>{config.get('telegram_scan_days', 3)}</b>\n"
+        f"telegram_scan_max_messages_per_channel: <b>{config.get('telegram_scan_max_messages_per_channel', 0)}</b>\n"
         f"auto_delete_messages_after_seconds: <b>{config.get('auto_delete_messages_after_seconds', 600)}</b>\n"
         f"notify_user_on_startup: <b>{config.get('notify_user_on_startup', True)}</b>\n"
-        f"website debug mode: <b>{bool(config.get('debug_parsing', True))}</b>\n"
-        f"female-only rejection enabled: <b>{bool(filters.get('female_only_reject_patterns'))}</b>\n"
+        "female-only rejection enabled: <b>True</b>\n"
         f"hard reject patterns count: <b>{hard_reject_count}</b>\n\n"
         "<b>Core keywords:</b>\n"
         + _html(core)

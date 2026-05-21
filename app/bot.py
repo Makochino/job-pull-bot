@@ -16,9 +16,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -31,22 +28,16 @@ from .formatter import (
     format_deleted_saved_vacancy,
     format_latest,
     format_no_pending_review,
-    format_no_more_vacancies,
-    format_pagination_prompt,
-    format_pagination_stopped,
     format_rejected_vacancies,
-    format_review_vacancy,
     format_review_vacancy_messages,
     format_saved_vacancy_messages,
-    format_saved_vacancies,
     format_saved_vacancies_page,
     format_settings,
     format_stats,
     format_tg_pull_report,
-    format_vacancy,
 )
 from .telegram_sources import fetch_telegram_vacancies, read_channels
-from .utils import SourceResult, Vacancy, as_int, word_similarity
+from .utils import SourceResult, Vacancy, as_int, vacancy_identity_key, word_similarity
 
 
 logger = logging.getLogger(__name__)
@@ -55,21 +46,15 @@ TELEGRAM_BUTTON = "🔎 Pull Telegram jobs"
 REVIEW_BUTTON = "🧾 Review vacancies"
 SAVED_BUTTON = "❤️ Saved vacancies"
 DEBUG_BUTTON = "🗑 Rejected / Debug"
+REVIEW_LIKE_BUTTON = "✅ Like"
+REVIEW_DISLIKE_BUTTON = "❌ Dislike"
 SAVED_OPEN_BUTTON = "🔍 Open by number"
 SAVED_DELETE_BUTTON = "🗑 Delete by number"
-SAVED_PREV_BUTTON = "⬅️ Prev"
+SAVED_PREV_BUTTON = "⬅️ Previous"
 SAVED_NEXT_BUTTON = "➡️ Next"
 SAVED_EXIT_BUTTON = "🚪 Exit"
+SAVED_BACK_BUTTON = "↩️ Back to saved vacancies"
 SAVED_PAGE_SIZE = 5
-
-
-@dataclass
-class PaginationSession:
-    source_type: str
-    vacancies: list[Vacancy]
-    offset: int = 0
-    batch_size: int = 5
-    message_delay: float = 0.35
 
 
 @dataclass
@@ -80,7 +65,6 @@ class AppContext:
     telethon_client: object
     base_dir: Path
     pull_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pagination_sessions: dict[int, PaginationSession] = field(default_factory=dict)
     last_reports: dict[str, str] = field(default_factory=dict)
 
 
@@ -105,6 +89,10 @@ class SavedVacancyStates(StatesGroup):
     waiting_delete_number = State()
 
 
+class ReviewVacancyStates(StatesGroup):
+    reviewing = State()
+
+
 def _config_int(config: dict[str, Any], key: str, default: int) -> int:
     return as_int(config.get(key), default)
 
@@ -126,10 +114,6 @@ def _auto_delete_delay(context: AppContext) -> int:
         return 0
     delay = as_int(value, 600)
     return max(0, delay)
-
-
-def _batch_size(context: AppContext) -> int:
-    return max(1, _config_int(context.config, "batch_size", 5))
 
 
 def schedule_delete_message(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
@@ -158,7 +142,7 @@ def _schedule_message_delete(message: Message, context: AppContext) -> None:
 
 async def _answer(message: Message, context: AppContext, text: str, **kwargs: Any) -> Message:
     kwargs.setdefault("parse_mode", ParseMode.HTML)
-    kwargs.setdefault("reply_markup", _reply_keyboard())
+    kwargs.setdefault("reply_markup", main_menu_keyboard())
     sent = await message.answer(text, **kwargs)
     _schedule_message_delete(sent, context)
     return sent
@@ -178,14 +162,7 @@ async def _prepare_command(message: Message, context: AppContext) -> bool:
     return True
 
 
-async def _is_authorized_callback(callback: CallbackQuery, context: AppContext) -> bool:
-    if callback.from_user.id != context.owner_id:
-        await callback.answer("Access denied.", show_alert=True)
-        return False
-    return True
-
-
-def _reply_keyboard() -> ReplyKeyboardMarkup:
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=TELEGRAM_BUTTON)],
@@ -199,51 +176,56 @@ def _reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _review_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Like", callback_data=f"review:like:{vacancy_id}"),
-                InlineKeyboardButton(text="❌ Dislike", callback_data=f"review:dislike:{vacancy_id}"),
-            ]
-        ]
+def _reply_keyboard() -> ReplyKeyboardMarkup:
+    return main_menu_keyboard()
+
+
+def review_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=REVIEW_LIKE_BUTTON), KeyboardButton(text=REVIEW_DISLIKE_BUTTON)],
+            [KeyboardButton(text=SAVED_EXIT_BUTTON)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Review this vacancy",
     )
 
 
-def _saved_list_keyboard(page: int, total: int, page_size: int = SAVED_PAGE_SIZE) -> InlineKeyboardMarkup:
-    page_count = max(1, (total + page_size - 1) // page_size)
-    navigation: list[InlineKeyboardButton] = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(text=SAVED_PREV_BUTTON, callback_data="saved:prev"))
-    if page + 1 < page_count:
-        navigation.append(InlineKeyboardButton(text=SAVED_NEXT_BUTTON, callback_data="saved:next"))
+def saved_menu_keyboard(has_next: bool, has_prev: bool) -> ReplyKeyboardMarkup:
+    navigation = []
+    if has_prev:
+        navigation.append(KeyboardButton(text=SAVED_PREV_BUTTON))
+    if has_next:
+        navigation.append(KeyboardButton(text=SAVED_NEXT_BUTTON))
 
-    rows = [
-        [
-            InlineKeyboardButton(text=SAVED_OPEN_BUTTON, callback_data="saved:open"),
-            InlineKeyboardButton(text=SAVED_DELETE_BUTTON, callback_data="saved:delete"),
-        ]
+    keyboard = [
+        [KeyboardButton(text=SAVED_OPEN_BUTTON), KeyboardButton(text=SAVED_DELETE_BUTTON)],
     ]
     if navigation:
-        rows.append(navigation)
-    rows.append([InlineKeyboardButton(text=SAVED_EXIT_BUTTON, callback_data="saved:exit")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        keyboard.append(navigation)
+    keyboard.append([KeyboardButton(text=SAVED_EXIT_BUTTON)])
 
-
-def _saved_exit_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=SAVED_EXIT_BUTTON, callback_data="saved:exit")]]
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Manage saved vacancies",
     )
 
 
-def _pagination_keyboard(source_type: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Next 5", callback_data=f"page:next:{source_type}"),
-                InlineKeyboardButton(text="Stop", callback_data=f"page:stop:{source_type}"),
-            ]
-        ]
+def number_input_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=SAVED_BACK_BUTTON)],
+            [KeyboardButton(text=SAVED_EXIT_BUTTON)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Enter saved vacancy number",
     )
 
 
@@ -297,16 +279,16 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
         await _send_settings(message, context)
 
     @router.message(Command("review"))
-    async def review_handler(message: Message) -> None:
+    async def review_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
-        await _send_next_review_vacancy(message, context)
+        await show_review_screen(message, context, state)
 
     @router.message(F.text == REVIEW_BUTTON)
-    async def review_button_handler(message: Message) -> None:
+    async def review_button_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
-        await _send_next_review_vacancy(message, context)
+        await show_review_screen(message, context, state)
 
     @router.message(Command("latest", "liked", "saved"))
     async def saved_command_handler(message: Message, state: FSMContext) -> None:
@@ -366,26 +348,102 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
             return
         await _start_tg_pull(message, context)
 
+    @router.message(ReviewVacancyStates.reviewing, F.text == REVIEW_LIKE_BUTTON)
+    async def review_like_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _handle_review_action(message, context, state, "like")
+
+    @router.message(ReviewVacancyStates.reviewing, F.text == REVIEW_DISLIKE_BUTTON)
+    async def review_dislike_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _handle_review_action(message, context, state, "dislike")
+
+    @router.message(ReviewVacancyStates.reviewing, F.text == SAVED_EXIT_BUTTON)
+    async def review_exit_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.clear()
+        await _answer(message, context, "Exited review mode.", reply_markup=main_menu_keyboard())
+
+    @router.message(ReviewVacancyStates.reviewing)
+    async def review_fallback_handler(message: Message) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await _answer(
+            message,
+            context,
+            "Use the review buttons below.",
+            reply_markup=review_menu_keyboard(),
+        )
+
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_OPEN_BUTTON)
+    async def saved_open_button_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.set_state(SavedVacancyStates.waiting_open_number)
+        await _answer(
+            message,
+            context,
+            "Enter the saved vacancy number to open, or press Exit.",
+            reply_markup=number_input_keyboard(),
+        )
+
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_DELETE_BUTTON)
+    async def saved_delete_button_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.set_state(SavedVacancyStates.waiting_delete_number)
+        await _answer(
+            message,
+            context,
+            "Enter the saved vacancy number to delete, or press Exit.",
+            reply_markup=number_input_keyboard(),
+        )
+
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_PREV_BUTTON)
+    async def saved_prev_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        page = max(0, await _saved_page_from_state(state) - 1)
+        await _send_saved_vacancies(message, context, state, page=page)
+
+    @router.message(SavedVacancyStates.browsing, F.text == SAVED_NEXT_BUTTON)
+    async def saved_next_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        page = await _saved_page_from_state(state) + 1
+        await _send_saved_vacancies(message, context, state, page=page)
+
     @router.message(SavedVacancyStates.browsing, F.text == SAVED_EXIT_BUTTON)
     async def saved_exit_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
         await state.clear()
-        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
+        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=main_menu_keyboard())
+
+    @router.message(SavedVacancyStates.waiting_open_number, F.text == SAVED_BACK_BUTTON)
+    @router.message(SavedVacancyStates.waiting_delete_number, F.text == SAVED_BACK_BUTTON)
+    async def saved_back_handler(message: Message, state: FSMContext) -> None:
+        if not await _prepare_command(message, context):
+            return
+        await state.set_state(SavedVacancyStates.browsing)
+        await _send_saved_vacancies(message, context, state)
 
     @router.message(SavedVacancyStates.waiting_open_number, F.text == SAVED_EXIT_BUTTON)
     async def saved_open_exit_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
         await state.clear()
-        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
+        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=main_menu_keyboard())
 
     @router.message(SavedVacancyStates.waiting_delete_number, F.text == SAVED_EXIT_BUTTON)
     async def saved_delete_exit_handler(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
         await state.clear()
-        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
+        await _answer(message, context, "Exited saved-vacancies mode.", reply_markup=main_menu_keyboard())
 
     @router.message(SavedVacancyStates.waiting_open_number)
     async def saved_open_number_handler(message: Message, state: FSMContext) -> None:
@@ -400,28 +458,18 @@ def register_handlers(dispatcher: Dispatcher, context: AppContext) -> None:
         await _handle_saved_delete_number(message, context, state)
 
     @router.message(SavedVacancyStates.browsing)
-    async def saved_browsing_fallback(message: Message) -> None:
+    async def saved_browsing_fallback(message: Message, state: FSMContext) -> None:
         if not await _prepare_command(message, context):
             return
-        await _answer(message, context, "Use the saved-vacancy buttons below the list.", reply_markup=_reply_keyboard())
-
-    @router.callback_query(F.data.startswith("review:"))
-    async def review_callback(callback: CallbackQuery) -> None:
-        if not await _is_authorized_callback(callback, context):
-            return
-        await _handle_review_callback(callback, context)
-
-    @router.callback_query(F.data.startswith("page:"))
-    async def pagination_callback(callback: CallbackQuery) -> None:
-        if not await _is_authorized_callback(callback, context):
-            return
-        await _handle_pagination(callback, context)
-
-    @router.callback_query(F.data.startswith("saved:"))
-    async def saved_callback(callback: CallbackQuery, state: FSMContext) -> None:
-        if not await _is_authorized_callback(callback, context):
-            return
-        await _handle_saved_callback(callback, context, state)
+        rows = context.database.liked_vacancies()
+        page = _clamp_saved_page(len(rows), await _saved_page_from_state(state))
+        has_prev, has_next = _saved_page_flags(len(rows), page)
+        await _answer(
+            message,
+            context,
+            "Use the saved-vacancy buttons below.",
+            reply_markup=saved_menu_keyboard(has_next=has_next, has_prev=has_prev),
+        )
 
     @router.message()
     async def unknown_message_handler(message: Message) -> None:
@@ -437,12 +485,20 @@ async def _send_latest(message: Message, context: AppContext) -> None:
     await _answer(message, context, format_latest(rows), disable_web_page_preview=True)
 
 
-async def _send_next_review_vacancy(message: Message, context: AppContext) -> None:
+async def show_review_screen(message: Message, context: AppContext, state: FSMContext) -> None:
+    await state.set_state(ReviewVacancyStates.reviewing)
     row = context.database.next_pending_vacancy()
     if row is None:
-        await _answer(message, context, format_no_pending_review())
+        await state.update_data(current_review_id=None)
+        await _answer(
+            message,
+            context,
+            format_no_pending_review(),
+            reply_markup=review_menu_keyboard(),
+        )
         return
 
+    await state.update_data(current_review_id=int(row["id"]))
     left_count = context.database.pending_review_count()
     chunks = format_review_vacancy_messages(row, left_count)
     for index, chunk in enumerate(chunks):
@@ -451,43 +507,42 @@ async def _send_next_review_vacancy(message: Message, context: AppContext) -> No
             message,
             context,
             chunk,
-            reply_markup=_review_keyboard(int(row["id"])) if is_last else None,
+            reply_markup=review_menu_keyboard(),
             disable_web_page_preview=True,
         )
 
 
-async def _handle_review_callback(callback: CallbackQuery, context: AppContext) -> None:
-    data = callback.data or ""
-    parts = data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-
-    _, action, raw_id = parts
-    try:
-        vacancy_id = int(raw_id)
-    except ValueError:
-        await callback.answer()
+async def _handle_review_action(
+    message: Message,
+    context: AppContext,
+    state: FSMContext,
+    action: str,
+) -> None:
+    data = await state.get_data()
+    vacancy_id = as_int(data.get("current_review_id"), 0)
+    if vacancy_id <= 0:
+        await show_review_screen(message, context, state)
         return
 
     if action == "like":
-        changed = context.database.like_vacancy(vacancy_id)
-        await callback.answer("Saved" if changed else "Already reviewed")
+        status = context.database.like_vacancy_status(vacancy_id)
+        if status in {"duplicate_saved", "already_saved"}:
+            await _answer(
+                message,
+                context,
+                "⚠️ Эта вакансия уже добавлена в сохранённые.",
+                reply_markup=review_menu_keyboard(),
+            )
+        elif status not in {"saved"}:
+            await _answer(message, context, "This vacancy was already reviewed.", reply_markup=review_menu_keyboard())
     elif action == "dislike":
         changed = context.database.dislike_vacancy(vacancy_id)
-        await callback.answer("Disliked" if changed else "Already reviewed")
+        if not changed:
+            await _answer(message, context, "This vacancy was already reviewed.", reply_markup=review_menu_keyboard())
     else:
-        await callback.answer()
         return
 
-    if isinstance(callback.message, Message):
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramAPIError:
-            logger.debug("Could not remove review buttons from message %s", callback.message.message_id)
-        if not changed:
-            return
-        await _send_next_review_vacancy(callback.message, context)
+    await show_review_screen(message, context, state)
 
 
 async def _open_saved_vacancies(message: Message, context: AppContext, state: FSMContext) -> None:
@@ -503,6 +558,13 @@ def _clamp_saved_page(total: int, page: int) -> int:
     return min(max(0, page), page_count - 1)
 
 
+def _saved_page_flags(total: int, page: int) -> tuple[bool, bool]:
+    page_count = max(1, (total + SAVED_PAGE_SIZE - 1) // SAVED_PAGE_SIZE)
+    has_prev = page > 0
+    has_next = page + 1 < page_count
+    return has_prev, has_next
+
+
 async def _saved_page_from_state(state: FSMContext) -> int:
     data = await state.get_data()
     return as_int(data.get("saved_page"), 0)
@@ -513,103 +575,24 @@ async def _send_saved_vacancies(
     context: AppContext,
     state: FSMContext,
     page: int | None = None,
+    prefix: str = "",
 ) -> None:
     rows = context.database.liked_vacancies()
     if page is None:
         page = await _saved_page_from_state(state)
     page = _clamp_saved_page(len(rows), page)
     await state.update_data(saved_page=page)
+    has_prev, has_next = _saved_page_flags(len(rows), page)
+    text = format_saved_vacancies_page(rows, page=page, page_size=SAVED_PAGE_SIZE)
+    if prefix:
+        text = f"{prefix}\n\n{text}"
     await _answer(
         message,
         context,
-        format_saved_vacancies_page(rows, page=page, page_size=SAVED_PAGE_SIZE),
-        reply_markup=_saved_list_keyboard(page, len(rows), SAVED_PAGE_SIZE) if rows else _saved_exit_keyboard(),
+        text,
+        reply_markup=saved_menu_keyboard(has_next=has_next, has_prev=has_prev),
         disable_web_page_preview=True,
     )
-
-
-async def _edit_saved_vacancies(
-    callback: CallbackQuery,
-    context: AppContext,
-    state: FSMContext,
-    page: int,
-) -> None:
-    rows = context.database.liked_vacancies()
-    page = _clamp_saved_page(len(rows), page)
-    await state.update_data(saved_page=page)
-    text = format_saved_vacancies_page(rows, page=page, page_size=SAVED_PAGE_SIZE)
-    keyboard = _saved_list_keyboard(page, len(rows), SAVED_PAGE_SIZE) if rows else _saved_exit_keyboard()
-    if isinstance(callback.message, Message):
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            return
-        except TelegramAPIError:
-            logger.debug("Could not edit saved-vacancies page", exc_info=True)
-            await _send_saved_vacancies(callback.message, context, state, page=page)
-
-
-async def _handle_saved_callback(callback: CallbackQuery, context: AppContext, state: FSMContext) -> None:
-    action = (callback.data or "").split(":", maxsplit=1)[-1]
-    rows = context.database.liked_vacancies()
-    page = await _saved_page_from_state(state)
-
-    if action == "exit":
-        await state.clear()
-        await callback.answer("Exited")
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except TelegramAPIError:
-                logger.debug("Could not clear saved-vacancies keyboard", exc_info=True)
-            await _answer(callback.message, context, "Exited saved-vacancies mode.", reply_markup=_reply_keyboard())
-        return
-
-    if not rows:
-        await callback.answer("No saved vacancies.", show_alert=False)
-        if isinstance(callback.message, Message):
-            await _edit_saved_vacancies(callback, context, state, page=0)
-        return
-
-    if action == "prev":
-        await callback.answer()
-        await _edit_saved_vacancies(callback, context, state, page - 1)
-        return
-
-    if action == "next":
-        await callback.answer()
-        await _edit_saved_vacancies(callback, context, state, page + 1)
-        return
-
-    if action == "open":
-        await state.set_state(SavedVacancyStates.waiting_open_number)
-        await callback.answer()
-        if isinstance(callback.message, Message):
-            await _answer(
-                callback.message,
-                context,
-                "🔍 Send the global saved vacancy number to open.",
-                reply_markup=_saved_exit_keyboard(),
-            )
-        return
-
-    if action == "delete":
-        await state.set_state(SavedVacancyStates.waiting_delete_number)
-        await callback.answer()
-        if isinstance(callback.message, Message):
-            await _answer(
-                callback.message,
-                context,
-                "🗑 Send the global saved vacancy number to delete.",
-                reply_markup=_saved_exit_keyboard(),
-            )
-        return
-
-    await callback.answer()
 
 
 async def _handle_saved_open_number(message: Message, context: AppContext, state: FSMContext) -> None:
@@ -619,14 +602,14 @@ async def _handle_saved_open_number(message: Message, context: AppContext, state
             message,
             context,
             "Send a plain number, for example <b>3</b>, or press Exit.",
-            reply_markup=_saved_exit_keyboard(),
+            reply_markup=number_input_keyboard(),
         )
         return
 
     rows = context.database.liked_vacancies()
     if not rows:
         await state.set_state(SavedVacancyStates.browsing)
-        await _answer(message, context, "❤️ <b>No saved vacancies yet.</b>", reply_markup=_reply_keyboard())
+        await _send_saved_vacancies(message, context, state, page=0)
         return
 
     number = int(raw_value)
@@ -635,18 +618,21 @@ async def _handle_saved_open_number(message: Message, context: AppContext, state
             message,
             context,
             f"Number out of range. Send a number from <b>1</b> to <b>{len(rows)}</b>, or press Exit.",
-            reply_markup=_saved_exit_keyboard(),
+            reply_markup=number_input_keyboard(),
         )
         return
 
     await state.set_state(SavedVacancyStates.browsing)
     row = rows[number - 1]
-    for chunk in format_saved_vacancy_messages(row, number):
+    chunks = format_saved_vacancy_messages(row, number)
+    saved_page = await _saved_page_from_state(state)
+    has_prev, has_next = _saved_page_flags(len(rows), saved_page)
+    for index, chunk in enumerate(chunks):
         await _answer(
             message,
             context,
             chunk,
-            reply_markup=None,
+            reply_markup=saved_menu_keyboard(has_next=has_next, has_prev=has_prev),
             disable_web_page_preview=True,
         )
 
@@ -658,14 +644,14 @@ async def _handle_saved_delete_number(message: Message, context: AppContext, sta
             message,
             context,
             "Send a plain number, for example <b>3</b>, or press Exit.",
-            reply_markup=_saved_exit_keyboard(),
+            reply_markup=number_input_keyboard(),
         )
         return
 
     rows = context.database.liked_vacancies()
     if not rows:
         await state.set_state(SavedVacancyStates.browsing)
-        await _answer(message, context, "❤️ <b>No saved vacancies to delete.</b>", reply_markup=_reply_keyboard())
+        await _send_saved_vacancies(message, context, state, page=0)
         return
 
     number = int(raw_value)
@@ -674,7 +660,7 @@ async def _handle_saved_delete_number(message: Message, context: AppContext, sta
             message,
             context,
             f"Number out of range. Send a number from <b>1</b> to <b>{len(rows)}</b>, or press Exit.",
-            reply_markup=_saved_exit_keyboard(),
+            reply_markup=number_input_keyboard(),
         )
         return
 
@@ -683,21 +669,10 @@ async def _handle_saved_delete_number(message: Message, context: AppContext, sta
     await state.set_state(SavedVacancyStates.browsing)
     page = _clamp_saved_page(len(rows) - 1, await _saved_page_from_state(state))
     if not deleted:
-        await _answer(
-            message,
-            context,
-            "That saved vacancy was already changed. Here is the updated saved list.",
-            reply_markup=_reply_keyboard(),
-        )
+        prefix = "That saved vacancy was already changed. Here is the updated saved list."
     else:
-        await _answer(
-            message,
-            context,
-            format_deleted_saved_vacancy(row, number),
-            reply_markup=_reply_keyboard(),
-            disable_web_page_preview=True,
-        )
-    await _send_saved_vacancies(message, context, state, page=page)
+        prefix = format_deleted_saved_vacancy(row, number)
+    await _send_saved_vacancies(message, context, state, page=page, prefix=prefix)
 
 
 async def _send_rejected(message: Message, context: AppContext) -> None:
@@ -755,7 +730,12 @@ async def _start_tg_pull(message: Message, context: AppContext) -> None:
         await _answer(message, context, "⏳ <b>A search is already running.</b>\nPlease wait.")
         return
 
-    await _answer(message, context, "🔎 <b>Searching Telegram channels...</b>")
+    await _answer(
+        message,
+        context,
+        "🔎 <b>Searching Telegram vacancies from the last 48 hours only.</b>",
+        reply_markup=main_menu_keyboard(),
+    )
     async with context.pull_lock:
         await _run_pull_tg(message, context)
 
@@ -766,22 +746,22 @@ async def _run_pull_tg(message: Message, context: AppContext) -> None:
     try:
         channels = read_channels(context.base_dir / "channels.txt")
         channels_empty = not channels
-        scan_days = _config_int(context.config, "telegram_scan_days", 3)
+        scan_hours = 48
         max_messages_per_channel = _config_int(context.config, "telegram_scan_max_messages_per_channel", 0)
 
         telegram_result = (
             await fetch_telegram_vacancies(
                 context.telethon_client,
                 channels,
-                days_back=scan_days,
                 max_messages_per_channel=max_messages_per_channel,
+                hours_back=scan_hours,
             )
             if channels
             else SourceResult()
         )
 
         filtered = _filter_candidates(telegram_result.vacancies, context.config, context.database)
-        mode = f"last {scan_days} days"
+        mode = f"last {scan_hours} hours only"
         fresh = _prepare_fresh_vacancies(context.database, filtered.matched)
         queued = fresh.vacancies
         duplicates = fresh.duplicates
@@ -913,7 +893,7 @@ def _prepare_fresh_vacancies(database: Database, vacancies: list[Vacancy]) -> Fr
         duplicate = database.find_duplicate(vacancy)
         if duplicate:
             state = str(duplicate.get("review_state") or "")
-            if bool(duplicate.get("sent")) or state in {"liked", "disliked", "deleted", "rejected"}:
+            if bool(duplicate.get("sent")) or state in {"liked", "disliked", "deleted", "duplicate", "rejected"}:
                 already_sent += 1
             else:
                 duplicates += 1
@@ -985,20 +965,20 @@ def _sort_latest(vacancies: list[Vacancy]) -> list[Vacancy]:
 
 
 def _find_current_batch_duplicate(vacancy: Vacancy, fresh: list[Vacancy]) -> Vacancy | None:
+    identity_key = vacancy_identity_key(vacancy)
     for existing in fresh:
+        if identity_key and identity_key == vacancy_identity_key(existing):
+            return existing
         if vacancy.content_hash_exact and vacancy.content_hash_exact == existing.content_hash_exact:
             return existing
-        if vacancy.source_type == "telegram" or existing.source_type == "telegram":
-            continue
         if vacancy.content_hash_normalized and vacancy.content_hash_normalized == existing.content_hash_normalized:
             return existing
         if (
             vacancy.parent_content_hash
             and vacancy.parent_content_hash == existing.parent_content_hash
-            and (vacancy.role or vacancy.vacancy_type)
-            and (existing.role or existing.vacancy_type)
-            and (vacancy.role or vacancy.vacancy_type) != (existing.role or existing.vacancy_type)
         ):
+            return existing
+        if vacancy.source_type == "telegram" or existing.source_type == "telegram":
             continue
         if vacancy.source_type == existing.source_type:
             similarity = word_similarity(vacancy.content_normalized or vacancy.text, existing.content_normalized or existing.text)
@@ -1013,108 +993,6 @@ def _save_pending_vacancies(database: Database, vacancies: list[Vacancy]) -> int
         if database.insert_vacancy(vacancy, sent=False, review_state="pending"):
             inserted += 1
     return inserted
-
-
-async def _start_paginated_delivery(
-    message: Message,
-    context: AppContext,
-    source_type: str,
-    vacancies: list[Vacancy],
-    message_delay: float,
-) -> int:
-    if not vacancies:
-        context.pagination_sessions.pop(context.owner_id, None)
-        return 0
-
-    session = PaginationSession(
-        source_type=source_type,
-        vacancies=vacancies,
-        offset=0,
-        batch_size=_batch_size(context),
-        message_delay=message_delay,
-    )
-    context.pagination_sessions[context.owner_id] = session
-    sent_now = await _send_next_batch(message, context, session)
-    if session.offset >= len(session.vacancies):
-        context.pagination_sessions.pop(context.owner_id, None)
-        await _answer(message, context, format_no_more_vacancies())
-    else:
-        await _answer(
-            message,
-            context,
-            format_pagination_prompt(session.offset, len(session.vacancies)),
-            reply_markup=_pagination_keyboard(source_type),
-        )
-    return sent_now
-
-
-async def _send_next_batch(message: Message, context: AppContext, session: PaginationSession) -> int:
-    batch = session.vacancies[session.offset : session.offset + session.batch_size]
-    sent = 0
-    for vacancy in batch:
-        try:
-            await _answer(message, context, format_vacancy(vacancy), disable_web_page_preview=True)
-            context.database.mark_sent_by_hashes(
-                vacancy.content_hash_exact or vacancy.content_hash,
-                vacancy.content_hash_normalized,
-                vacancy.source_type,
-            )
-            sent += 1
-            session.offset += 1
-            await asyncio.sleep(session.message_delay)
-        except TelegramAPIError:
-            logger.exception("Failed to send vacancy to Telegram: %s", vacancy.content_hash)
-    return sent
-
-
-async def _handle_pagination(callback: CallbackQuery, context: AppContext) -> None:
-    data = callback.data or ""
-    parts = data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-
-    _, action, source_type = parts
-    session = context.pagination_sessions.get(callback.from_user.id)
-    if not session or session.source_type != source_type:
-        await callback.answer("No active batch.", show_alert=False)
-        return
-
-    if not isinstance(callback.message, Message):
-        await callback.answer()
-        return
-
-    if action == "stop":
-        remaining = max(0, len(session.vacancies) - session.offset)
-        context.pagination_sessions.pop(callback.from_user.id, None)
-        await callback.answer("Stopped")
-        await _answer(callback.message, context, format_pagination_stopped(remaining))
-        return
-
-    if action != "next":
-        await callback.answer()
-        return
-
-    await callback.answer()
-    sent_now = await _send_next_batch(callback.message, context, session)
-    if sent_now:
-        context.database.increment_stats(
-            {
-                "sent_total": sent_now,
-                f"sent_{'tg' if source_type == 'telegram' else 'sites'}_total": sent_now,
-            }
-        )
-
-    if session.offset >= len(session.vacancies):
-        context.pagination_sessions.pop(callback.from_user.id, None)
-        await _answer(callback.message, context, format_no_more_vacancies())
-    else:
-        await _answer(
-            callback.message,
-            context,
-            format_pagination_prompt(session.offset, len(session.vacancies)),
-            reply_markup=_pagination_keyboard(source_type),
-        )
 
 
 async def _set_command_menu(bot: Bot) -> None:

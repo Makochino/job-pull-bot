@@ -355,7 +355,8 @@ def format_saved_vacancies_page(rows: list[Any], page: int, page_size: int = 5) 
         lines.append(f"Page <b>{page + 1}</b>/<b>{page_count}</b>")
 
     for index, row in enumerate(rows[start:end], start=start + 1):
-        name = detect_establishment_name(str(_row_get(row, "text", ""))) or "No info"
+        title = truncate_text(str(_row_get(row, "title", "") or "").strip(), 80)
+        name = detect_establishment_name(str(_row_get(row, "text", ""))) or title or "No info"
         link = str(_row_get(row, "link", "") or "not available")
         lines.append(f"\n#{index} — {_html(name)}\n{_html(link)}")
     return _clip_message("\n".join(lines))
@@ -437,7 +438,7 @@ def format_settings(config: dict[str, Any]) -> str:
         "⚙️ <b>Current settings</b>\n\n"
         f"Profile: <b>{_html(str(config.get('profile_name', 'restaurant/cafe jobs in Odesa')))}</b>\n"
         f"min_score: <b>{config.get('min_score', 5)}</b>\n"
-        f"telegram_scan_days: <b>{config.get('telegram_scan_days', 3)}</b>\n"
+        "telegram_scan_window: <b>last 48 hours only</b>\n"
         f"telegram_scan_max_messages_per_channel: <b>{config.get('telegram_scan_max_messages_per_channel', 0)}</b>\n"
         f"auto_delete_messages_after_seconds: <b>{config.get('auto_delete_messages_after_seconds', 600)}</b>\n"
         f"notify_user_on_startup: <b>{config.get('notify_user_on_startup', True)}</b>\n"
@@ -482,6 +483,7 @@ def format_tg_pull_report(
         "📊 <b>Telegram report</b>",
         "",
         f"Mode: <b>{_html(mode)}</b>",
+        "Searching Telegram vacancies from the last 48 hours only.",
         f"Checked: <b>{posts_checked}</b>",
         f"Matched: <b>{matched}</b>",
         f"Rejected: <b>{hard_rejected}</b>",

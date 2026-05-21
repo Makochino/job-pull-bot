@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 from dotenv import load_dotenv
@@ -198,6 +199,74 @@ def now_iso() -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def normalize_vacancy_link(value: str | None) -> str:
+    if not value:
+        return ""
+
+    raw = re.sub(r"\s+", "", str(value).strip().strip("<>()[]{}"))
+    if not raw:
+        return ""
+
+    username_match = re.fullmatch(r"@?([A-Za-z0-9_]{3,})/(\d+)", raw)
+    if username_match:
+        username, message_id = username_match.groups()
+        return f"https://t.me/{username.casefold()}/{message_id}"
+
+    if raw.startswith("@"):
+        return raw.casefold()
+
+    if raw.startswith(("t.me/", "telegram.me/")):
+        raw = f"https://{raw}"
+
+    parsed = urlparse(raw)
+    host = parsed.netloc.casefold().removeprefix("www.")
+    if host not in {"t.me", "telegram.me"}:
+        return raw.rstrip("/")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 3 and parts[0].casefold() == "c" and parts[2].isdigit():
+        return f"https://t.me/c/{parts[1]}/{parts[2]}"
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"https://t.me/{parts[0].lstrip('@').casefold()}/{parts[1]}"
+
+    normalized_path = "/".join(part.casefold() for part in parts)
+    return f"https://t.me/{normalized_path}".rstrip("/")
+
+
+def content_hash(value: str | None) -> str:
+    return normalized_content_hash(value)
+
+
+def vacancy_identity_key(vacancy: Vacancy) -> str:
+    if vacancy.source_type == "telegram":
+        normalized_link = normalize_vacancy_link(vacancy.link)
+        if normalized_link and re.search(r"/\d+$", normalized_link):
+            return f"telegram-link|{normalized_link}"
+
+        metadata = vacancy.metadata or {}
+        message_id = metadata.get("message_id")
+        channel = (
+            metadata.get("chat_id")
+            or metadata.get("username")
+            or metadata.get("source_channel")
+            or vacancy.source
+        )
+        channel_key = clean_text(str(channel)).lstrip("@").casefold()
+        if message_id and channel_key:
+            return f"telegram-message|{channel_key}|{message_id}"
+
+        fallback_hash = content_hash("\n".join([vacancy.title or "", vacancy.text or ""]))
+        if fallback_hash:
+            return f"telegram-content|{fallback_hash}"
+
+    metadata_key = str((vacancy.metadata or {}).get("dedupe_key") or (vacancy.metadata or {}).get("source_key") or "")
+    if metadata_key:
+        return metadata_key
+    return vacancy.content_hash_exact or vacancy.content_hash or content_hash(
+        "\n".join([vacancy.title or "", vacancy.text or ""])
+    )
 
 
 def clean_text(value: str | None) -> str:

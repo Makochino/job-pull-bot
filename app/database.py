@@ -6,7 +6,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .utils import Vacancy, normalize_vacancy_content, normalized_content_hash, now_iso, word_similarity
+from .utils import (
+    Vacancy,
+    normalize_vacancy_content,
+    normalize_vacancy_link,
+    normalized_content_hash,
+    now_iso,
+    vacancy_identity_key,
+    word_similarity,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -181,6 +189,74 @@ class Database:
                     WHERE dedupe_key IS NOT NULL AND dedupe_key != ''
                 """,
             )
+            self._create_unique_index(
+                connection,
+                "ux_vacancies_telegram_link",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_vacancies_telegram_link
+                    ON vacancies(link)
+                    WHERE source_type = 'telegram'
+                      AND link IS NOT NULL
+                      AND link != ''
+                """,
+            )
+            self._create_unique_index(
+                connection,
+                "ux_rejected_telegram_link",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_rejected_telegram_link
+                    ON rejected_vacancies(link)
+                    WHERE source_type = 'telegram'
+                      AND link IS NOT NULL
+                      AND link != ''
+                """,
+            )
+            self._create_unique_index(
+                connection,
+                "ux_vacancies_telegram_channel_message",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_vacancies_telegram_channel_message
+                    ON vacancies(source_channel, source_message_id)
+                    WHERE source_type = 'telegram'
+                      AND source_channel IS NOT NULL
+                      AND source_channel != ''
+                      AND source_message_id IS NOT NULL
+                """,
+            )
+            self._create_unique_index(
+                connection,
+                "ux_rejected_telegram_channel_message",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_rejected_telegram_channel_message
+                    ON rejected_vacancies(source_channel, source_message_id)
+                    WHERE source_type = 'telegram'
+                      AND source_channel IS NOT NULL
+                      AND source_channel != ''
+                      AND source_message_id IS NOT NULL
+                """,
+            )
+            self._create_unique_index(
+                connection,
+                "ux_vacancies_telegram_normalized_hash",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_vacancies_telegram_normalized_hash
+                    ON vacancies(content_hash_normalized)
+                    WHERE source_type = 'telegram'
+                      AND content_hash_normalized IS NOT NULL
+                      AND content_hash_normalized != ''
+                """,
+            )
+            self._create_unique_index(
+                connection,
+                "ux_rejected_telegram_normalized_hash",
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_rejected_telegram_normalized_hash
+                    ON rejected_vacancies(content_hash_normalized)
+                    WHERE source_type = 'telegram'
+                      AND content_hash_normalized IS NOT NULL
+                      AND content_hash_normalized != ''
+                """,
+            )
         logger.info("SQLite database initialized: %s", self.path)
 
     def _create_unique_index(self, connection: sqlite3.Connection, name: str, sql: str) -> None:
@@ -326,10 +402,11 @@ class Database:
 
         exact_hash = vacancy.content_hash_exact or vacancy.content_hash
         metadata = vacancy.metadata or {}
-        dedupe_key = str(metadata.get("dedupe_key") or metadata.get("source_key") or exact_hash)
+        dedupe_key = vacancy_identity_key(vacancy)
         source_channel = str(metadata.get("source_channel") or metadata.get("username") or vacancy.source)
         source_chat_id = str(metadata.get("chat_id") or "") or None
         source_message_id = metadata.get("message_id")
+        link = normalize_vacancy_link(vacancy.link) if vacancy.source_type == "telegram" else vacancy.link
         normalized_text = vacancy.content_normalized or normalize_vacancy_content(
             "\n".join([vacancy.title or "", vacancy.text or ""])
         )
@@ -364,7 +441,7 @@ class Database:
                         dedupe_key,
                         vacancy.title,
                         vacancy.text,
-                        vacancy.link,
+                        link,
                         vacancy.published_at,
                         vacancy.score,
                         created_at,
@@ -437,16 +514,31 @@ class Database:
     ) -> None:
         exact_hash = vacancy.content_hash_exact or vacancy.content_hash
         metadata = vacancy.metadata or {}
-        dedupe_key = str(metadata.get("dedupe_key") or metadata.get("source_key") or exact_hash)
+        dedupe_key = vacancy_identity_key(vacancy)
         source_channel = str(metadata.get("source_channel") or metadata.get("username") or vacancy.source)
         source_chat_id = str(metadata.get("chat_id") or "") or None
         source_message_id = metadata.get("message_id")
+        link = normalize_vacancy_link(vacancy.link) if vacancy.source_type == "telegram" else vacancy.link
         normalized_text = vacancy.content_normalized or normalize_vacancy_content(
             "\n".join([vacancy.title or "", vacancy.text or ""])
         )
         normalized_hash = vacancy.content_hash_normalized or normalized_content_hash(normalized_text)
         timestamp = now_iso()
         with self._connect() as connection:
+            if self._touch_rejected_duplicate(
+                connection,
+                timestamp=timestamp,
+                exact_hash=exact_hash,
+                dedupe_key=dedupe_key,
+                normalized_hash=normalized_hash,
+                source_type=vacancy.source_type,
+                score=score,
+                reject_reason=reject_reason,
+                hard_rejected=hard_rejected,
+                matched_role_keywords=self._json_list(vacancy.matched_role_keywords),
+                filter_debug=vacancy.filter_debug,
+            ):
+                return
             connection.execute(
                 """
                 INSERT INTO rejected_vacancies (
@@ -479,7 +571,7 @@ class Database:
                     dedupe_key,
                     vacancy.title,
                     vacancy.text,
-                    vacancy.link,
+                    link,
                     vacancy.published_at,
                     score,
                     timestamp,
@@ -503,6 +595,54 @@ class Database:
                     vacancy.filter_debug,
                 ),
             )
+
+    def _touch_rejected_duplicate(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        timestamp: str,
+        exact_hash: str,
+        dedupe_key: str,
+        normalized_hash: str,
+        source_type: str,
+        score: int,
+        reject_reason: str,
+        hard_rejected: bool,
+        matched_role_keywords: str,
+        filter_debug: str,
+    ) -> bool:
+        cursor = connection.execute(
+            """
+            UPDATE rejected_vacancies
+            SET last_seen_at = ?,
+                seen_count = seen_count + 1,
+                score = ?,
+                reject_reason = ?,
+                hard_rejected = ?,
+                matched_role_keywords = ?,
+                filter_debug = ?
+            WHERE content_hash = ?
+               OR content_hash_exact = ?
+               OR (? != '' AND dedupe_key = ?)
+               OR (? != '' AND source_type = ? AND content_hash_normalized = ?)
+            """,
+            (
+                timestamp,
+                score,
+                reject_reason,
+                1 if hard_rejected else 0,
+                matched_role_keywords,
+                filter_debug,
+                exact_hash,
+                exact_hash,
+                dedupe_key,
+                dedupe_key,
+                normalized_hash,
+                source_type,
+                normalized_hash,
+            ),
+        )
+        return cursor.rowcount > 0
 
     def pending_review_count(self) -> int:
         with self._connect() as connection:
@@ -553,8 +693,89 @@ class Database:
             )
         return cursor.rowcount > 0
 
+    def like_vacancy_status(self, vacancy_id: int) -> str:
+        timestamp = now_iso()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM vacancies WHERE id = ?", (vacancy_id,)).fetchone()
+            if row is None:
+                return "missing"
+
+            state = str(row["review_state"] or "")
+            if state == "liked":
+                return "already_saved"
+            if state != "pending":
+                return "already_reviewed"
+
+            if self._has_liked_duplicate(connection, row):
+                connection.execute(
+                    """
+                    UPDATE vacancies
+                    SET review_state = 'duplicate',
+                        reviewed_at = COALESCE(reviewed_at, ?)
+                    WHERE id = ?
+                      AND review_state = 'pending'
+                    """,
+                    (timestamp, vacancy_id),
+                )
+                return "duplicate_saved"
+
+            cursor = connection.execute(
+                """
+                UPDATE vacancies
+                SET review_state = 'liked',
+                    reviewed_at = COALESCE(reviewed_at, ?),
+                    saved_at = COALESCE(saved_at, ?)
+                WHERE id = ?
+                  AND review_state = 'pending'
+                """,
+                (timestamp, timestamp, vacancy_id),
+            )
+        return "saved" if cursor.rowcount > 0 else "already_reviewed"
+
+    def _has_liked_duplicate(self, connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
+        dedupe_key = str(row["dedupe_key"] or "")
+        exact_hash = str(row["content_hash_exact"] or row["content_hash"] or "")
+        normalized_hash = str(row["content_hash_normalized"] or "")
+        parent_hash = str(row["parent_content_hash"] or "")
+        source_type = str(row["source_type"] or "")
+        duplicate = connection.execute(
+            """
+            SELECT id
+            FROM vacancies
+            WHERE id != ?
+              AND review_state = 'liked'
+              AND source_type = ?
+              AND (
+                    (? != '' AND dedupe_key = ?)
+                 OR (? != '' AND (content_hash = ? OR content_hash_exact = ?))
+                 OR (? != '' AND content_hash_normalized = ?)
+                 OR (? != '' AND (parent_content_hash = ? OR content_hash = ? OR content_hash_exact = ?))
+                 OR (parent_content_hash IS NOT NULL AND parent_content_hash != '' AND parent_content_hash IN (?, ?))
+              )
+            LIMIT 1
+            """,
+            (
+                row["id"],
+                source_type,
+                dedupe_key,
+                dedupe_key,
+                exact_hash,
+                exact_hash,
+                exact_hash,
+                normalized_hash,
+                normalized_hash,
+                parent_hash,
+                parent_hash,
+                parent_hash,
+                parent_hash,
+                exact_hash,
+                parent_hash,
+            ),
+        ).fetchone()
+        return duplicate is not None
+
     def like_vacancy(self, vacancy_id: int) -> bool:
-        return self._set_review_state(vacancy_id, "liked")
+        return self.like_vacancy_status(vacancy_id) == "saved"
 
     def dislike_vacancy(self, vacancy_id: int) -> bool:
         return self._set_review_state(vacancy_id, "disliked")
@@ -587,6 +808,38 @@ class Database:
             )
         return cursor.rowcount > 0
 
+    def reset_vacancy_state(self) -> dict[str, int]:
+        with self._connect() as connection:
+            vacancy_count = self._table_count(connection, "vacancies")
+            rejected_count = self._table_count(connection, "rejected_vacancies")
+            stats_count = self._table_count(connection, "stats")
+
+            connection.execute("DELETE FROM vacancies")
+            connection.execute("DELETE FROM rejected_vacancies")
+            connection.execute("DELETE FROM stats")
+            connection.execute(
+                """
+                DELETE FROM sqlite_sequence
+                WHERE name IN ('vacancies', 'rejected_vacancies')
+                """
+            )
+        return {
+            "vacancies": vacancy_count,
+            "rejected_vacancies": rejected_count,
+            "stats": stats_count,
+            "deleted_total": vacancy_count + rejected_count + stats_count,
+        }
+
+    def _table_count(self, connection: sqlite3.Connection, table_name: str) -> int:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if int(row["count"]) == 0:
+            return 0
+        count_row = connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+        return int(count_row["count"])
+
     def latest_rejected(self, limit: int = 10) -> list[sqlite3.Row]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -602,7 +855,7 @@ class Database:
 
     def find_duplicate(self, vacancy: Vacancy, similarity_threshold: float = 0.85) -> dict[str, Any] | None:
         exact_hash = vacancy.content_hash_exact or vacancy.content_hash
-        dedupe_key = str((vacancy.metadata or {}).get("dedupe_key") or (vacancy.metadata or {}).get("source_key") or exact_hash)
+        dedupe_key = vacancy_identity_key(vacancy)
         normalized_text = vacancy.content_normalized or normalize_vacancy_content(
             "\n".join([vacancy.title or "", vacancy.text or ""])
         )
@@ -665,10 +918,12 @@ class Database:
                     """
                     SELECT id, source, source_type, sent, review_state
                     FROM vacancies
-                    WHERE content_hash = ? OR content_hash_exact = ?
+                    WHERE content_hash = ?
+                       OR content_hash_exact = ?
+                       OR parent_content_hash = ?
                     LIMIT 1
                     """,
-                    (parent_hash, parent_hash),
+                    (parent_hash, parent_hash, parent_hash),
                 ).fetchone()
                 if row:
                     return self._duplicate_result(row, vacancy, "parent-post")
@@ -677,43 +932,67 @@ class Database:
                     """
                     SELECT id, source, source_type, 0 AS sent, 'rejected' AS review_state
                     FROM rejected_vacancies
-                    WHERE content_hash = ? OR content_hash_exact = ?
+                    WHERE content_hash = ?
+                       OR content_hash_exact = ?
+                       OR parent_content_hash = ?
                     LIMIT 1
                     """,
-                    (parent_hash, parent_hash),
+                    (parent_hash, parent_hash, parent_hash),
                 ).fetchone()
                 if row:
                     return self._duplicate_result(row, vacancy, "rejected-parent-post")
 
-            if vacancy.source_type == "telegram":
-                return None
-
             if normalized_hash:
-                row = connection.execute(
-                    """
-                    SELECT id, source, source_type, sent, review_state
-                    FROM vacancies
-                    WHERE source_type = ?
-                      AND content_hash_normalized = ?
-                    LIMIT 1
-                    """,
-                    (vacancy.source_type, normalized_hash),
-                ).fetchone()
+                if vacancy.source_type == "telegram":
+                    row = connection.execute(
+                        """
+                        SELECT id, source, source_type, sent, review_state
+                        FROM vacancies
+                        WHERE content_hash_normalized = ?
+                        LIMIT 1
+                        """,
+                        (normalized_hash,),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT id, source, source_type, sent, review_state
+                        FROM vacancies
+                        WHERE source_type = ?
+                          AND content_hash_normalized = ?
+                        LIMIT 1
+                        """,
+                        (vacancy.source_type, normalized_hash),
+                    ).fetchone()
                 if row:
                     return self._duplicate_result(row, vacancy, "normalized")
 
-                row = connection.execute(
-                    """
-                    SELECT id, source, source_type, 0 AS sent, 'rejected' AS review_state
-                    FROM rejected_vacancies
-                    WHERE source_type = ?
-                      AND content_hash_normalized = ?
-                    LIMIT 1
-                    """,
-                    (vacancy.source_type, normalized_hash),
-                ).fetchone()
+                if vacancy.source_type == "telegram":
+                    row = connection.execute(
+                        """
+                        SELECT id, source, source_type, 0 AS sent, 'rejected' AS review_state
+                        FROM rejected_vacancies
+                        WHERE content_hash_normalized = ?
+                        LIMIT 1
+                        """,
+                        (normalized_hash,),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT id, source, source_type, 0 AS sent, 'rejected' AS review_state
+                        FROM rejected_vacancies
+                        WHERE source_type = ?
+                          AND content_hash_normalized = ?
+                        LIMIT 1
+                        """,
+                        (vacancy.source_type, normalized_hash),
+                    ).fetchone()
                 if row:
                     return self._duplicate_result(row, vacancy, "rejected-normalized")
+
+            if vacancy.source_type == "telegram":
+                return None
 
             rows = list(connection.execute(
                 """
@@ -756,6 +1035,9 @@ class Database:
                 return result
 
         return None
+
+    def is_duplicate_vacancy(self, vacancy: Vacancy) -> bool:
+        return self.find_duplicate(vacancy) is not None
 
     @staticmethod
     def _duplicate_result(row: sqlite3.Row, vacancy: Vacancy, kind: str) -> dict[str, Any]:

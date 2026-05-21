@@ -66,12 +66,14 @@ TEST_CONFIG = {
 def make_vacancy(source_key: str, text: str, role: str = "waiter", source: str = "@jobs") -> Vacancy:
     exact_hash = sha256_text(source_key)
     normalized_text = normalize_text_for_hashing(text)
+    message_id = next((part for part in reversed(source_key.split("|")) if part.isdigit()), "1")
+    channel = source.lstrip("@") or "jobs"
     return Vacancy(
         source=source,
         source_type="telegram",
         title=text.splitlines()[0],
         text=text,
-        link="https://t.me/jobs/1",
+        link=f"https://t.me/{channel}/{message_id}",
         content_hash=exact_hash,
         content_hash_exact=exact_hash,
         content_hash_normalized=normalized_content_hash(normalized_text),
@@ -113,6 +115,10 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('TELEGRAM_BUTTON = "🔎 Pull Telegram jobs"', bot_source)
         self.assertNotIn("WEBSITE_BUTTON", bot_source)
         self.assertNotIn("Pull Website jobs", bot_source)
+        self.assertIn("def review_menu_keyboard() -> ReplyKeyboardMarkup", bot_source)
+        self.assertIn("def saved_menu_keyboard(has_next: bool, has_prev: bool) -> ReplyKeyboardMarkup", bot_source)
+        self.assertNotIn("InlineKeyboardMarkup", bot_source)
+        self.assertNotIn("callback_query", bot_source)
 
     def test_experience_required_detection(self) -> None:
         required_cases = [
@@ -250,7 +256,10 @@ class RegressionTests(unittest.TestCase):
                 "Офіціант\nМожна без досвіду",
                 source="@other_jobs",
             )
-            self.assertTrue(database.insert_vacancy(repost))
+            self.assertFalse(database.insert_vacancy(repost))
+            duplicate = database.find_duplicate(repost)
+            self.assertIsNotNone(duplicate)
+            self.assertTrue(duplicate["cross_channel"])
 
             rejected = make_vacancy("telegram|12345|11|role|waiter", "Официант\nДосвід роботи від 1 року")
             database.record_rejected_vacancy(rejected, "target role requires experience", hard_rejected=True)
@@ -310,21 +319,21 @@ class RegressionTests(unittest.TestCase):
 
 
 class TelegramSourceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fetch_telegram_vacancies_scans_last_three_days(self) -> None:
+    async def test_fetch_telegram_vacancies_scans_last_48_hours(self) -> None:
         now = datetime.now(timezone.utc)
         client = FakeClient(
             [
                 FakeMessage(10, "Офіціант\nМожна без досвіду", now - timedelta(days=1)),
-                FakeMessage(9, "Раннер\nМожна без досвіду", now - timedelta(days=2, hours=23)),
+                FakeMessage(9, "Раннер\nМожна без досвіду", now - timedelta(hours=49)),
                 FakeMessage(8, "Офіціант\nold", now - timedelta(days=4)),
             ]
         )
 
-        result = await fetch_telegram_vacancies(client, ["@jobs"], days_back=3)
+        result = await fetch_telegram_vacancies(client, ["@jobs"], hours_back=48)
 
-        self.assertEqual(result.checked, 2)
-        self.assertEqual([vacancy.metadata["message_id"] for vacancy in result.vacancies], [10, 9])
-        self.assertEqual(result.vacancies[0].metadata["dedupe_key"], "telegram|12345|10")
+        self.assertEqual(result.checked, 1)
+        self.assertEqual([vacancy.metadata["message_id"] for vacancy in result.vacancies], [10])
+        self.assertEqual(result.vacancies[0].metadata["dedupe_key"], "telegram-link|https://t.me/jobs/10")
 
 
 if __name__ == "__main__":

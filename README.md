@@ -33,7 +33,7 @@ Run `/start` to show the persistent keyboard:
 
 Slash commands:
 
-- `/pull_tg` — scan Telegram channels for the last 3 days
+- `/pull_tg` — scan Telegram channels for the last 48 hours only
 - `/review` — continue reviewing pending vacancies
 - `/saved`, `/liked`, `/latest` — open saved vacancies
 - `/rejected` — inspect recently rejected vacancies
@@ -44,11 +44,7 @@ Website job pulling is disabled in the active bot. There is no Website Jobs butt
 
 ## Telegram Pull
 
-`/pull_tg` and the Telegram pull button scan every channel in `channels.txt` from newest messages backward until messages are older than:
-
-```yaml
-telegram_scan_days: 3
-```
+`/pull_tg` and the Telegram pull button scan every channel in `channels.txt` from newest messages backward until messages are older than 48 hours.
 
 By default there is no per-channel message cap:
 
@@ -87,10 +83,11 @@ Link:
 <source link>
 ```
 
-Inline buttons:
+Reply keyboard buttons under the input field:
 
 - `✅ Like` marks the vacancy as liked/saved
 - `❌ Dislike` marks it as disliked/reviewed
+- `🚪 Exit` returns to the persistent main menu
 
 After either action, the next pending vacancy is shown immediately. Pending, liked, disliked, and deleted-saved states survive bot restarts.
 
@@ -98,16 +95,13 @@ Original Telegram message text is stored in SQLite and displayed without summari
 
 ## Duplicate Tracking
 
-Telegram dedupe is based on source identity:
+Telegram dedupe is based on source identity plus a normalized content hash:
 
 - source type: `telegram`
-- channel/chat identity
-- Telegram message id
-- target role when a post creates multiple target-role candidates
+- normalized Telegram message link or channel/chat identity plus Telegram message id
+- normalized text/content hash for reposts and linkless messages
 
-The same channel/message/role is not queued again after another pull, even after restart. Liked, disliked, deleted, and rejected items remain known so they do not reappear.
-
-The same vacancy reposted in a different channel may still appear as a separate item.
+The same vacancy is not queued again after another pull, even after restart. Liked, disliked, deleted, rejected, and cross-channel reposted items remain known so they do not reappear.
 
 ## Saved Vacancies
 
@@ -127,11 +121,17 @@ Buttons:
 
 - `🔍 Open by number`
 - `🗑 Delete by number`
-- `⬅️ Prev`
+- `⬅️ Previous`
 - `➡️ Next`
 - `🚪 Exit`
 
 Opening by number shows the full original vacancy text and link. Deleting marks the saved row as `deleted`; it does not remove duplicate tracking.
+
+To clear old vacancy, queue, saved, rejected and stats rows without deleting the database schema or config, run:
+
+```powershell
+python scripts\reset_vacancy_state.py
+```
 
 ## Setup
 

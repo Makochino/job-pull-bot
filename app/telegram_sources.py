@@ -10,10 +10,11 @@ from telethon.tl.custom import Message
 from .utils import (
     SourceResult,
     Vacancy,
+    content_hash,
     first_line_title,
     normalize_for_hash,
+    normalize_vacancy_link,
     normalize_text_for_hashing,
-    normalized_content_hash,
     preserve_original_text,
     sha256_text,
 )
@@ -60,18 +61,20 @@ def _message_to_vacancy(channel: str, entity: object, message: Message) -> Vacan
 
     source = _source_name(channel, entity)
     message_id = int(message.id)
-    link = _post_link(channel, entity, message_id)
+    link = normalize_vacancy_link(_post_link(channel, entity, message_id))
     published_at = message.date.isoformat(timespec="seconds") if message.date else ""
     username = getattr(entity, "username", None)
     chat_id = getattr(entity, "id", None)
     chat_identifier = str(chat_id or username or source or channel)
-    if message_id:
-        source_key = f"telegram|{chat_identifier}|{message_id}"
+    if link:
+        source_key = f"telegram-link|{link}"
+    elif message_id:
+        source_key = f"telegram-message|{chat_identifier}|{message_id}"
     else:
-        source_key = f"telegram|{chat_identifier}|{normalize_for_hash(text)}"
+        source_key = f"telegram-content|{normalize_for_hash(text)}"
     content_hash_exact = sha256_text(source_key)
     normalized_text = normalize_text_for_hashing(text)
-    content_hash_normalized = normalized_content_hash(text)
+    content_hash_normalized = content_hash(text)
 
     return Vacancy(
         source=source,
@@ -106,11 +109,13 @@ def _as_utc(value: datetime | None) -> datetime | None:
 async def fetch_telegram_vacancies(
     client: object,
     channels: list[str],
-    days_back: int = 3,
+    days_back: int | None = None,
     max_messages_per_channel: int = 0,
+    hours_back: int | None = None,
 ) -> SourceResult:
     result = SourceResult()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days_back))
+    scan_hours = max(1, int(hours_back)) if hours_back is not None else max(1, int(days_back or 2)) * 24
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=scan_hours)
 
     for channel in channels:
         try:
@@ -141,7 +146,8 @@ async def fetch_telegram_vacancies(
             logger.exception("Unexpected Telegram source error: %s", channel)
 
     logger.info(
-        "Telegram fetch finished: checked=%s candidates=%s errors=%s",
+        "Telegram fetch finished: hours_back=%s checked=%s candidates=%s errors=%s",
+        scan_hours,
         result.checked,
         len(result.vacancies),
         result.errors,

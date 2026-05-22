@@ -221,7 +221,9 @@ def normalize_vacancy_link(value: str | None) -> str:
         raw = f"https://{raw}"
 
     parsed = urlparse(raw)
-    host = parsed.netloc.casefold().removeprefix("www.")
+    host = parsed.netloc.casefold()
+    if host.startswith("www."):
+        host = host[4:]
     if host not in {"t.me", "telegram.me"}:
         return raw.rstrip("/")
 
